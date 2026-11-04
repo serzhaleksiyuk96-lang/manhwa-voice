@@ -26,6 +26,9 @@ import android.widget.Toast
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -37,6 +40,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -69,6 +73,7 @@ class ReaderService : AccessibilityService() {
     private val pending = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
 
     private val memory = TextMemory()
+    @Volatile private var lastFishErrorAt = 0L
     private var foregroundPkg: String? = null
     private var readingPkg: String? = null
 
@@ -175,15 +180,56 @@ class ReaderService : AccessibilityService() {
     }
 
     private suspend fun speakNew(phrases: List<Phrase>): Int {
-        var count = 0
+        val toSay = ArrayList<String>()
         for (p in phrases) {
-            if (memory.seen(p.text)) continue
-            setState(State.SPEAKING)
-            speak(p.text)
-            memory.add(p.text)
-            count++
+            if (memory.seen(p.text) || toSay.any { it == p.text }) continue
+            toSay += p.text
         }
-        return count
+        if (toSay.isEmpty()) return 0
+        if (FishTts.enabled(prefs)) return speakWithFish(toSay)
+        for (t in toSay) {
+            setState(State.SPEAKING)
+            speak(t)
+            memory.add(t)
+        }
+        return toSay.size
+    }
+
+    /**
+     * Fish Audio: пока звучит реплика, следующая уже скачивается — так меньше пауз.
+     * Если Fish Audio недоступен, реплика читается системным голосом.
+     */
+    private suspend fun speakWithFish(list: List<String>): Int = coroutineScope {
+        var next: Deferred<File?> = async(Dispatchers.IO) { fishSynth(list[0]) }
+        for (i in list.indices) {
+            val file = next.await()
+            if (i + 1 < list.size) next = async(Dispatchers.IO) { fishSynth(list[i + 1]) }
+            setState(State.SPEAKING)
+            if (file != null) {
+                try {
+                    if (!FishTts.play(file)) speak(list[i])
+                } finally {
+                    file.delete()
+                }
+            } else {
+                speak(list[i])
+            }
+            memory.add(list[i])
+        }
+        list.size
+    }
+
+    private fun fishSynth(text: String): File? = try {
+        FishTts.synthesize(this, prefs, text)
+    } catch (e: Exception) {
+        Log.w(TAG, "Fish Audio failed: ${e.message}")
+        val now = SystemClock.uptimeMillis()
+        if (now - lastFishErrorAt > 60_000) {
+            lastFishErrorAt = now
+            val msg = if (e is FishTts.FishError) e.message else "нет связи с Fish Audio"
+            scope.launch { toast("Fish Audio: $msg. Читаю обычным голосом.") }
+        }
+        null
     }
 
     // ---------------- Главный цикл ----------------
@@ -194,6 +240,7 @@ class ReaderService : AccessibilityService() {
 
     private fun startReading() {
         readingPkg = foregroundPkg
+        cacheDir.listFiles()?.filter { it.name.startsWith("fish_") }?.forEach { it.delete() }
         loopJob = scope.launch {
             try {
                 runLoop()

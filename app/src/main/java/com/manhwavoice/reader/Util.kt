@@ -30,6 +30,9 @@ object Prefs {
     const val KEY_PITCH = "pitch"
     const val KEY_ENGINE = "tts_engine"
     const val KEY_VOICE = "tts_voice"
+    const val KEY_FISH_KEY = "fish_key"
+    const val KEY_FISH_VOICE = "fish_voice"
+    const val KEY_FISH_FREE = "fish_free"
     const val KEY_SCROLL = "scroll"
     const val KEY_PAUSE_TEXT = "pause_text"
     const val KEY_PAUSE_EMPTY = "pause_empty"
@@ -82,7 +85,9 @@ object Fingerprint {
 object Voices {
     val RU: Locale = Locale.forLanguageTag("ru-RU")
 
-    fun enginePref(p: SharedPreferences): String? = p.getString(Prefs.KEY_ENGINE, null)?.takeIf { it.isNotEmpty() }
+    /** Системный движок синтеза речи (Fish Audio — не системный, для него берём движок по умолчанию). */
+    fun enginePref(p: SharedPreferences): String? =
+        p.getString(Prefs.KEY_ENGINE, null)?.takeIf { it.isNotEmpty() && it != FishTts.ENGINE_ID }
 
     fun create(context: Context, enginePkg: String?, listener: TextToSpeech.OnInitListener): TextToSpeech =
         if (enginePkg == null) TextToSpeech(context, listener) else TextToSpeech(context, listener, enginePkg)

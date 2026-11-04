@@ -10,7 +10,14 @@ import android.os.Bundle
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.view.ViewGroup
+import android.media.MediaPlayer
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
+import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -26,6 +33,8 @@ class MainActivity : Activity() {
     private var ttsOk = false
     private lateinit var engineButton: Button
     private lateinit var voiceButton: Button
+    private lateinit var fishPanel: LinearLayout
+    private var fishPlayer: MediaPlayer? = null
     private var checking = false
     private var downloading = false
     private var waitingPermissionFor: Updater.Release? = null
@@ -78,7 +87,7 @@ class MainActivity : Activity() {
             root.addView(bar)
         }
 
-        text(getString(R.string.app_name), 24f, bold = true, top = 0)
+        text("Озвучка манхвы " + packageManager.getPackageInfo(packageName, 0).versionName, 24f, bold = true, top = 0)
         status = text("", 16f, top = 10)
         button("Открыть настройки спецвозможностей") {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -110,6 +119,59 @@ class MainActivity : Activity() {
         text("Голос", 18f, bold = true, top = 22)
         engineButton = button("Движок: …") { chooseEngine() }
         voiceButton = button("Голос: …") { chooseVoice() }
+
+        // Панель Fish Audio (видна, когда выбран движок Fish Audio)
+        fishPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(fishPanel)
+        fun fishText(s: String, size: Float = 14f) = TextView(this).apply {
+            text = s
+            textSize = size
+            setPadding(0, (6 * dp).toInt(), 0, (2 * dp).toInt())
+            fishPanel.addView(this)
+        }
+        fun fishField(hint: String, key: String, secret: Boolean) = EditText(this).apply {
+            this.hint = hint
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT or
+                (if (secret) InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_TEXT_VARIATION_URI)
+            setText(prefs.getString(key, ""))
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    prefs.edit().putString(key, s?.toString()?.trim().orEmpty()).apply()
+                }
+            })
+            fishPanel.addView(this, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        fishText("Fish Audio — нейросетевые голоса, звучат живее. Нужен интернет и аккаунт на fish.audio.")
+        fishText("API-ключ:")
+        fishField("вставьте ключ", Prefs.KEY_FISH_KEY, true)
+        fishText("Голос — ссылка или ID (пусто = голос по умолчанию):")
+        fishField("https://fish.audio/m/…", Prefs.KEY_FISH_VOICE, false)
+        CheckBox(this).apply {
+            text = "Бесплатная модель (без оплаты, но может работать медленнее)"
+            isChecked = prefs.getBoolean(Prefs.KEY_FISH_FREE, true)
+            setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean(Prefs.KEY_FISH_FREE, checked).apply() }
+            fishPanel.addView(this)
+        }
+        Button(this).apply {
+            text = "Открыть fish.audio"
+            isAllCaps = false
+            setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://fish.audio"))) }
+            fishPanel.addView(this, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        fishText(
+            "Как настроить:\n" +
+                "1. Зарегистрируйтесь на fish.audio.\n" +
+                "2. В разделе API создайте API-ключ и вставьте его выше.\n" +
+                "3. Найдите голос в каталоге (например, по слову «русский»), откройте его и скопируйте ссылку " +
+                "из адресной строки во второе поле.\n" +
+                "4. Нажмите «▶ Прослушать».\n" +
+                "Платная модель стоит \$15 за 1 млн байт текста — глава манхвы примерно 5–10 центов. " +
+                "Если Fish Audio недоступен, реплики читаются обычным голосом.",
+            13f
+        )
         slider("Высота голоса", Prefs.KEY_PITCH, 50, 200, 100) { "$it%" }
         button("▶ Прослушать") { preview() }
         button("Скачать русские голоса") {
@@ -259,7 +321,10 @@ class MainActivity : Activity() {
             val def = t?.defaultEngine
             "по умолчанию" + (engines.firstOrNull { it.name == def }?.label?.let { " ($it)" } ?: "")
         } else engines.firstOrNull { it.name == enginePkg }?.label ?: enginePkg
-        engineButton.text = "Движок: $engineLabel"
+        val fish = FishTts.enabled(prefs)
+        engineButton.text = if (fish) "Движок: Fish Audio" else "Движок: $engineLabel"
+        fishPanel.visibility = if (fish) View.VISIBLE else View.GONE
+        voiceButton.visibility = if (fish) View.GONE else View.VISIBLE
 
         val voiceName = prefs.getString(Prefs.KEY_VOICE, null)
         val voices = if (ttsOk && t != null) Voices.russianVoices(t) else emptyList()
@@ -273,15 +338,24 @@ class MainActivity : Activity() {
     private fun chooseEngine() {
         val t = tts ?: return
         val engines = t.engines
-        val labels = listOf("По умолчанию (как в системе)") + engines.map { it.label }
+        val labels = listOf("По умолчанию (как в системе)") + engines.map { it.label } +
+            "Fish Audio (нейросеть, нужен интернет)"
         val prefs = Prefs.get(this)
         val current = Voices.enginePref(prefs)
-        val checked = if (current == null) 0 else engines.indexOfFirst { it.name == current } + 1
+        val checked = when {
+            FishTts.enabled(prefs) -> labels.size - 1
+            current == null -> 0
+            else -> engines.indexOfFirst { it.name == current } + 1
+        }
         AlertDialog.Builder(this)
             .setTitle("Движок синтеза речи")
             .setSingleChoiceItems(labels.toTypedArray<CharSequence>(), checked) { dialog, which ->
                 val e = prefs.edit().remove(Prefs.KEY_VOICE)
-                if (which == 0) e.remove(Prefs.KEY_ENGINE) else e.putString(Prefs.KEY_ENGINE, engines[which - 1].name)
+                when (which) {
+                    0 -> e.remove(Prefs.KEY_ENGINE)
+                    labels.size - 1 -> e.putString(Prefs.KEY_ENGINE, FishTts.ENGINE_ID)
+                    else -> e.putString(Prefs.KEY_ENGINE, engines[which - 1].name)
+                }
                 e.apply()
                 dialog.dismiss()
                 initTts()
@@ -318,17 +392,43 @@ class MainActivity : Activity() {
     }
 
     private fun preview() {
+        if (FishTts.enabled(Prefs.get(this))) {
+            previewFish()
+            return
+        }
         val t = tts
         if (t == null || !ttsOk) {
             Toast.makeText(this, "Синтез речи недоступен", Toast.LENGTH_LONG).show()
             return
         }
         Voices.apply(t, Prefs.get(this))
-        t.speak("Хотите сказать, я, сильнейший рыцарь севера, сражён этим ничтожным выродком?!", TextToSpeech.QUEUE_FLUSH, null, "preview")
+        t.speak(SAMPLE, TextToSpeech.QUEUE_FLUSH, null, "preview")
+    }
+
+    private fun previewFish() {
+        Toast.makeText(this, "Fish Audio: озвучиваю…", Toast.LENGTH_SHORT).show()
+        val prefs = Prefs.get(this)
+        Thread {
+            try {
+                val file = FishTts.synthesize(this, prefs, SAMPLE)
+                runOnUiThread {
+                    fishPlayer?.let { runCatching { it.release() } }
+                    fishPlayer = FishTts.playOnce(file)
+                }
+            } catch (e: Exception) {
+                val msg = if (e is FishTts.FishError) e.message else "нет связи с сервером"
+                runOnUiThread { Toast.makeText(this, "Fish Audio: $msg", Toast.LENGTH_LONG).show() }
+            }
+        }.start()
     }
 
     override fun onDestroy() {
+        fishPlayer?.let { runCatching { it.release() } }
         tts?.shutdown()
         super.onDestroy()
+    }
+
+    companion object {
+        private const val SAMPLE = "Хотите сказать, я, сильнейший рыцарь севера, сражён этим ничтожным выродком?!"
     }
 }

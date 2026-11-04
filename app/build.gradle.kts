@@ -14,8 +14,6 @@ android {
         // Номер сборки на GitHub — чтобы каждое обновление ставилось поверх старой версии
         versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
         versionName = "1." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
-        // Название под значком вместе с версией, например «Озвучка манхвы 1.8»
-        resValue("string", "app_name", "Озвучка манхвы $versionName")
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
@@ -40,10 +38,6 @@ android {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("stable")
         }
-    }
-
-    buildFeatures {
-        resValues = true
     }
 
     compileOptions {

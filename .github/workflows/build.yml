@@ -34,13 +34,21 @@ jobs:
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           gradle assembleDebug --no-daemon --stacktrace
 
-      - name: Переименовать APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk ManhwaVoice.apk
+      - name: Переименовать APK (с номером версии)
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk "ManhwaVoice-1.${{ github.run_number }}.apk"
+          # Файл с постоянным именем нужен старым версиям приложения для автообновления
+          cp app/build/outputs/apk/debug/app-debug.apk ManhwaVoice.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ManhwaVoice-apk
-          path: ManhwaVoice.apk
+          name: ManhwaVoice-1.${{ github.run_number }}
+          path: ManhwaVoice-1.${{ github.run_number }}.apk
+
+      - name: Удалить прошлый выпуск (чтобы не копились старые файлы)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete latest --cleanup-tag -y --repo "${{ github.repository }}" || true
 
       - name: Выложить в Releases (удобно скачать с телефона)
         uses: softprops/action-gh-release@v2
@@ -48,9 +56,11 @@ jobs:
           tag_name: latest
           name: Озвучка манхвы 1.${{ github.run_number }}
           body: |
-            Скачайте ManhwaVoice.apk ниже и установите на телефон.
+            Скачайте ManhwaVoice-1.${{ github.run_number }}.apk ниже и установите на телефон.
             Если приложение уже установлено, оно предложит обновиться само.
 
             versionCode=${{ github.run_number }}
-          files: ManhwaVoice.apk
+          files: |
+            ManhwaVoice-1.${{ github.run_number }}.apk
+            ManhwaVoice.apk
           make_latest: true
