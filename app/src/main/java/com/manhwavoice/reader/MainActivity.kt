@@ -1,6 +1,8 @@
 package com.manhwavoice.reader
 
 import android.app.Activity
+import android.app.AlertDialog
+import android.net.Uri
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Typeface
@@ -19,7 +21,11 @@ import java.util.Locale
 class MainActivity : Activity() {
 
     private lateinit var status: TextView
+    private lateinit var updateStatus: TextView
     private var testTts: TextToSpeech? = null
+    private var checking = false
+    private var downloading = false
+    private var waitingPermissionFor: Updater.Release? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,6 +81,12 @@ class MainActivity : Activity() {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
+        text("Обновления", 18f, bold = true, top = 22)
+        val versionName = packageManager.getPackageInfo(packageName, 0).versionName
+        text("Установлена версия $versionName", 14f, top = 2)
+        updateStatus = text("", 15f, top = 2)
+        button("Проверить обновления") { checkForUpdates() }
+
         text("Как пользоваться", 18f, bold = true, top = 22)
         text(
             "1. Включите службу «Озвучка манхвы» в спецвозможностях (кнопка выше). " +
@@ -122,10 +134,78 @@ class MainActivity : Activity() {
             "Снимки экрана обрабатываются только на телефоне и никуда не отправляются.",
             13f, top = 22
         )
+
+        checkForUpdates()
+    }
+
+    // ---------------- Обновления ----------------
+
+    private fun checkForUpdates() {
+        if (checking || downloading) return
+        checking = true
+        updateStatus.text = "Проверяю обновления…"
+        Thread {
+            val release = runCatching { Updater.fetchLatest() }.getOrNull()
+            runOnUiThread {
+                checking = false
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                val current = Updater.currentVersion(this)
+                when {
+                    release == null -> updateStatus.text = "Не удалось проверить обновления (нет интернета?)"
+                    release.versionCode > current -> {
+                        updateStatus.text = "Доступна новая версия 1.${release.versionCode}"
+                        askToUpdate(release)
+                    }
+                    else -> updateStatus.text = "✅ У вас последняя версия"
+                }
+            }
+        }.start()
+    }
+
+    private fun askToUpdate(release: Updater.Release) {
+        val mb = if (release.apkSize > 0) " (около ${release.apkSize / 1_000_000} МБ)" else ""
+        AlertDialog.Builder(this)
+            .setTitle("Доступно обновление")
+            .setMessage("Вышла новая версия 1.${release.versionCode}. Скачать и установить$mb?\n\nНастройки и разрешения сохранятся.")
+            .setPositiveButton("Обновить") { _, _ -> startUpdate(release) }
+            .setNegativeButton("Позже", null)
+            .show()
+    }
+
+    private fun startUpdate(release: Updater.Release) {
+        if (!packageManager.canRequestPackageInstalls()) {
+            // Один раз нужно разрешить приложению устанавливать обновления
+            waitingPermissionFor = release
+            Toast.makeText(this, "Разрешите «Установку неизвестных приложений» и вернитесь назад", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+            return
+        }
+        if (downloading) return
+        downloading = true
+        updateStatus.text = "Скачиваю… 0%"
+        Thread {
+            try {
+                val apk = Updater.download(this, release) { pct ->
+                    runOnUiThread { updateStatus.text = "Скачиваю… $pct%" }
+                }
+                runOnUiThread { updateStatus.text = "Устанавливаю… подтвердите обновление в окне Android" }
+                Updater.install(this, apk)
+            } catch (e: Exception) {
+                runOnUiThread { updateStatus.text = "Ошибка обновления: ${e.message}" }
+            } finally {
+                downloading = false
+            }
+        }.start()
     }
 
     override fun onResume() {
         super.onResume()
+        waitingPermissionFor?.let { release ->
+            if (packageManager.canRequestPackageInstalls()) {
+                waitingPermissionFor = null
+                startUpdate(release)
+            }
+        }
         status.text = if (isServiceEnabled())
             "✅ Служба включена — кнопка ▶ должна быть на экране"
         else

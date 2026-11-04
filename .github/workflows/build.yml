@@ -46,7 +46,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Озвучка манхвы — последняя сборка
-          body: Скачайте ManhwaVoice.apk ниже и установите на телефон.
+          name: Озвучка манхвы 1.${{ github.run_number }}
+          body: |
+            Скачайте ManhwaVoice.apk ниже и установите на телефон.
+            Если приложение уже установлено, оно предложит обновиться само.
+
+            versionCode=${{ github.run_number }}
           files: ManhwaVoice.apk
           make_latest: true
