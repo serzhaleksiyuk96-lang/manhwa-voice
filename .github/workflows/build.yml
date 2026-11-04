@@ -34,13 +34,13 @@ jobs:
       - name: Собрать APK
         run: |
           echo "sdk.dir=$ANDROID_HOME" > local.properties
-          gradle assembleDebug --no-daemon --stacktrace
+          gradle assembleRelease --no-daemon --stacktrace
 
       - name: Переименовать APK (с номером версии)
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk "ManhwaVoice-1.${{ github.run_number }}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "ManhwaVoice-1.${{ github.run_number }}.apk"
           # Файл с постоянным именем нужен старым версиям приложения для автообновления
-          cp app/build/outputs/apk/debug/app-debug.apk ManhwaVoice.apk
+          cp app/build/outputs/apk/release/app-release.apk ManhwaVoice.apk
 
       - uses: actions/upload-artifact@v4
         with:

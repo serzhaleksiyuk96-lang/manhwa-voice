@@ -36,7 +36,10 @@ android {
             signingConfig = signingConfigs.getByName("stable")
         }
         release {
-            isMinifyEnabled = false
+            // R8: выкидывает неиспользуемый код (APK меньше) и оптимизирует (быстрее работает)
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.getByName("stable")
         }
     }
