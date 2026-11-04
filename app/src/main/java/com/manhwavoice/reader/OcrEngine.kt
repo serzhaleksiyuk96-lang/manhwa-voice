@@ -55,8 +55,11 @@ class OcrEngine(private val context: Context) {
         if (TextLayout.lexicon != null) return
         try {
             val t0 = System.currentTimeMillis()
-            TextLayout.lexicon = GZIPInputStream(context.assets.open("ru_words.tsv.gz"), 1 shl 16)
-                .bufferedReader().useLines { Lexicon.fromSortedTsv(it) }
+            // Сборщик Android сам распаковывает .gz в ресурсах (ru_words.tsv.gz → ru_words.tsv),
+            // поэтому пробуем оба варианта
+            val input = runCatching { context.assets.open("ru_words.tsv") }.getOrNull()
+                ?: GZIPInputStream(context.assets.open("ru_words.tsv.gz"), 1 shl 16)
+            TextLayout.lexicon = input.bufferedReader().useLines { Lexicon.fromSortedTsv(it) }
             Log.d(TAG, "словарь: ${TextLayout.lexicon?.size} слов за ${System.currentTimeMillis() - t0} мс")
         } catch (e: Exception) {
             Log.e(TAG, "dictionary load failed", e)   // без словаря тоже работает, только хуже
