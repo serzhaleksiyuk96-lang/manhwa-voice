@@ -43,6 +43,8 @@ class AppController(private val activity: ComponentActivity) {
     // ---------------- Настройки ----------------
 
     fun int(key: String, def: Int): Int { tick; return prefs.getInt(key, def) }
+    fun bool(key: String, def: Boolean): Boolean { tick; return prefs.getBoolean(key, def) }
+    fun setBool(key: String, v: Boolean) { prefs.edit().putBoolean(key, v).apply(); touch() }
     fun setInt(key: String, v: Int) { prefs.edit().putInt(key, v).apply(); touch() }
 
     // ---------------- Служба спецвозможностей ----------------

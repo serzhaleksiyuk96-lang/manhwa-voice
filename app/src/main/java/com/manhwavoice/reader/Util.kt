@@ -23,6 +23,10 @@ object Prefs {
     /** Пауза на экране без текста, мс */
     fun pauseNoText(p: SharedPreferences) = p.getInt(KEY_PAUSE_EMPTY, DEFAULT_PAUSE_EMPTY).toLong()
 
+    /** Листать и распознавать следующий экран, пока звучит последняя реплика */
+    fun earlyScroll(p: SharedPreferences) = p.getBoolean(KEY_EARLY_SCROLL, true)
+    const val KEY_EARLY_SCROLL = "early_scroll"
+
     const val DEFAULT_PAUSE_TEXT = 200
     const val DEFAULT_PAUSE_EMPTY = 600
 

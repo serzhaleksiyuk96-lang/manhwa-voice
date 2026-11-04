@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.os.Process
 import android.util.Log
 import com.googlecode.tesseract.android.TessBaseAPI
 import kotlinx.coroutines.Dispatchers
@@ -13,42 +14,63 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import java.io.File
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.zip.GZIPInputStream
 import kotlin.math.roundToInt
 
 /**
  * Распознавание текста на телефоне. Вся логика — в [ScreenText] (чистый Kotlin),
- * здесь только Tesseract и подготовка снимка. Два экземпляра Tesseract, каждый в своём потоке:
- *  - точная модель (tessdata_best) — пузыри и уточнение найденного текста;
- *  - быстрая модель (tessdata_fast) — поиск текста на остальном экране.
+ * здесь только Tesseract и подготовка снимка. Три экземпляра Tesseract, каждый в своём потоке:
+ *  - быстрая модель для пузырей (первый проход);
+ *  - точная модель — перечитать сомнительный пузырь и уточнить текст вне пузырей;
+ *  - быстрая модель для поиска текста на остальном экране.
  */
 class OcrEngine(private val context: Context) {
 
-    private val bestExecutor = Executors.newSingleThreadExecutor()
-    private val fastExecutor = Executors.newSingleThreadExecutor()
-    val bestDispatcher = bestExecutor.asCoroutineDispatcher()
-    val fastDispatcher = fastExecutor.asCoroutineDispatcher()
+    private fun executor(name: String): ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread({
+            // Распознавание — то, чего ждёт пользователь: повышенный приоритет
+            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) }
+            r.run()
+        }, name)
+    }
 
-    @Volatile private var best: TessBaseAPI? = null   // трогать только в bestExecutor
-    @Volatile private var fast: TessBaseAPI? = null   // трогать только в fastExecutor
+    private val bubbleExec = executor("ocr-bubbles")
+    private val bestExec = executor("ocr-best")
+    private val restExec = executor("ocr-rest")
+    val bubbleDispatcher = bubbleExec.asCoroutineDispatcher()
+    val bestDispatcher = bestExec.asCoroutineDispatcher()
+    val restDispatcher = restExec.asCoroutineDispatcher()
 
+    @Volatile private var bubbleTess: TessBaseAPI? = null   // только в bubbleExec
+    @Volatile private var best: TessBaseAPI? = null         // только в bestExec
+    @Volatile private var rest: TessBaseAPI? = null         // только в restExec
+
+    private val bubbleFn = OcrFn { img -> bubbleTess?.let { runTess(it, img) } ?: emptyList() }
     private val bestFn = OcrFn { img -> best?.let { runTess(it, img) } ?: emptyList() }
-    private val fastFn = OcrFn { img -> fast?.let { runTess(it, img) } ?: emptyList() }
+    private val restFn = OcrFn { img -> rest?.let { runTess(it, img) } ?: emptyList() }
 
-    /** Загружает обе модели и словарь (параллельно). */
+    /** Уже распознанные пузыри (после прокрутки не распознаются заново). */
+    val cache = BubbleCache()
+
+    /** Загружает модели и словарь (параллельно). */
     suspend fun ensureReady(): Boolean = coroutineScope {
-        val a = async(bestDispatcher) {
+        val a = async(bubbleDispatcher) {
+            if (bubbleTess == null) bubbleTess = open("tessdata_fast/rus.traineddata", "fast", TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK)
+            bubbleTess != null
+        }
+        val b = async(bestDispatcher) {
             if (best == null) best = open("tessdata/rus.traineddata", "best", TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK)
             best != null
         }
-        val b = async(fastDispatcher) {
-            if (fast == null) fast = open("tessdata_fast/rus.traineddata", "fast", TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
-            fast != null
+        val c = async(restDispatcher) {
+            if (rest == null) rest = open("tessdata_fast/rus.traineddata", "fast", TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
+            rest != null
         }
         val lex = async(Dispatchers.Default) { loadLexicon() }
         lex.await()
-        a.await() && b.await()
+        a.await() && b.await() && c.await()
     }
 
     private fun loadLexicon() {
@@ -66,10 +88,11 @@ class OcrEngine(private val context: Context) {
         }
     }
 
-    private fun open(asset: String, name: String, psm: Int): TessBaseAPI? = try {
+    /** Копирует модель из APK в файлы приложения (один раз; для двух экземпляров — без гонки). */
+    @Synchronized
+    private fun ensureModel(asset: String, name: String): File {
         // Модель из старых версий приложения больше не нужна
         File(context.filesDir, "tesseract").takeIf { it.exists() }?.deleteRecursively()
-
         val baseDir = File(context.filesDir, "tess_$name")
         val dataDir = File(baseDir, "tessdata").apply { mkdirs() }
         val model = File(dataDir, "rus.traineddata")
@@ -80,6 +103,11 @@ class OcrEngine(private val context: Context) {
             model.delete()
             tmp.renameTo(model)
         }
+        return baseDir
+    }
+
+    private fun open(asset: String, name: String, psm: Int): TessBaseAPI? = try {
+        val baseDir = ensureModel(asset, name)
         val t = TessBaseAPI()
         if (!t.init(baseDir.absolutePath, "rus", TessBaseAPI.OEM_LSTM_ONLY)) {
             t.recycle()
@@ -119,21 +147,32 @@ class OcrEngine(private val context: Context) {
         val argb = IntArray(w * h)
         work.getPixels(argb, 0, w, 0, 0, w, h)
         work.recycle()
-        val gray = IntArray(argb.size) { i ->
+        val gray = IntArray(argb.size)
+        for (i in argb.indices) {
             val p = argb[i]
-            (((p shr 16) and 0xff) * 30 + ((p shr 8) and 0xff) * 59 + (p and 0xff) * 11) / 100
+            gray[i] = (((p shr 16) and 0xff) * 30 + ((p shr 8) and 0xff) * 59 + (p and 0xff) * 11) / 100
         }
         val topLimit = if (skipTopCut) (statusBarPx * scale + h * 0.015f).roundToInt() else null
         val bottomLimit = if (skipBottomCut) (h * 0.94f).roundToInt() else null
         return ScreenText.prepare(gray, w, h, topLimit, bottomLimit)
     }
 
-    /** Пузыри — точной моделью. Вызывать в bestDispatcher. */
-    fun readBubbles(p: Prepared): List<Phrase> = ScreenText.readBubbles(p, bestFn)
+    /** Шаг для пузыря: узнан по памяти — или прочитан быстрой моделью. */
+    class BubbleStep(val sig: IntArray, val cached: BubbleCache.Hit?, val read: ScreenText.BubbleRead?)
 
-    /** Поиск текста вне пузырей — быстрой моделью. Вызывать в fastDispatcher. */
+    /** Вызывать в bubbleDispatcher. */
+    fun bubbleFirst(p: Prepared, b: Bubble): BubbleStep {
+        val sig = cache.signature(p, b)
+        cache.find(b, sig)?.let { return BubbleStep(sig, it, null) }
+        return BubbleStep(sig, null, ScreenText.bubbleFirstPass(p, b, bubbleFn))
+    }
+
+    /** Перечитать сомнительный пузырь точной моделью. Вызывать в bestDispatcher. */
+    fun bubbleSecond(r: ScreenText.BubbleRead): Phrase? = ScreenText.bubbleSecondPass(r, bestFn)
+
+    /** Поиск текста вне пузырей — быстрой моделью. Вызывать в restDispatcher. */
     fun detectRest(p: Prepared): List<Candidate> = try {
-        ScreenText.detectRest(p, fastFn)
+        ScreenText.detectRest(p, restFn)
     } catch (e: Exception) {
         Log.e(TAG, "detect failed", e)
         emptyList()
@@ -174,10 +213,12 @@ class OcrEngine(private val context: Context) {
     }
 
     fun release() {
-        bestExecutor.execute { best?.recycle(); best = null }
-        fastExecutor.execute { fast?.recycle(); fast = null }
-        bestExecutor.shutdown()
-        fastExecutor.shutdown()
+        bubbleExec.execute { bubbleTess?.recycle(); bubbleTess = null }
+        bestExec.execute { best?.recycle(); best = null }
+        restExec.execute { rest?.recycle(); rest = null }
+        bubbleExec.shutdown()
+        bestExec.shutdown()
+        restExec.shutdown()
     }
 
     companion object {

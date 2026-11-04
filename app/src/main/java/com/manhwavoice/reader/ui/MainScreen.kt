@@ -22,6 +22,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -182,6 +184,22 @@ private fun ReadingCard(c: AppController) {
         ValueSlider("Шаг прокрутки", c.int(Prefs.KEY_SCROLL, 60), 40..75, { "$it% экрана" }) { c.setInt(Prefs.KEY_SCROLL, it) }
         ValueSlider("Пауза после текста", c.int(Prefs.KEY_PAUSE_TEXT, Prefs.DEFAULT_PAUSE_TEXT), 0..3000, ::seconds) { c.setInt(Prefs.KEY_PAUSE_TEXT, it) }
         ValueSlider("Пауза на кадрах без текста", c.int(Prefs.KEY_PAUSE_EMPTY, Prefs.DEFAULT_PAUSE_EMPTY), 200..4000, ::seconds) { c.setInt(Prefs.KEY_PAUSE_EMPTY, it) }
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Листать заранее", color = Palette.TextMain, fontSize = 15.sp)
+                Text(
+                    "Пока звучит последняя реплика, страница уже листается и распознаётся дальше — паузы между экранами почти нет",
+                    color = Palette.TextDim, fontSize = 12.sp
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Switch(
+                checked = c.bool(Prefs.KEY_EARLY_SCROLL, true),
+                onCheckedChange = { c.setBool(Prefs.KEY_EARLY_SCROLL, it) },
+                colors = SwitchDefaults.colors(checkedTrackColor = Palette.Violet, checkedThumbColor = Color.White)
+            )
+        }
     }
 }
 

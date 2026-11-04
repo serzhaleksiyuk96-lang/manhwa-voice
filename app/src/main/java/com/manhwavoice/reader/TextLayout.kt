@@ -168,25 +168,32 @@ object TextLayout {
      * Уверенность Tesseract ненадёжна: правильное слово бывает с уверенностью 0,
      * а мусор с рисунка — с 40. Поэтому главный критерий — есть ли такое слово в языке.
      */
-    private fun checkWord(w: OcrWord): OcrWord? {
-        val lex = lexicon ?: return if (w.conf >= 15f) w else null
+    /** Насколько можно доверять слову после проверки по словарю. */
+    private enum class Trust { SURE, DOUBT }
+
+    private fun checkWord(w: OcrWord): Pair<OcrWord?, Trust> {
+        val lex = lexicon ?: return (if (w.conf >= 15f) w else null) to (if (w.conf >= 70f) Trust.SURE else Trust.DOUBT)
         val c = core(w.text)
-        if (c.isEmpty()) return null
+        if (c.isEmpty()) return null to Trust.DOUBT
         val k = lex.key(c)
         if (c in lex) {
             // В словаре из интернета много коротких обрывков («ра», «ня») — для 2–3 букв строже
-            if (k.length == 2 && k !in TWO_OK && w.conf < 75f) return null
-            if (k.length == 3 && (lex.rankOf(k) ?: Int.MAX_VALUE) > 20_000 && w.conf < 60f) return null
-            return w
+            if (k.length == 2 && k !in TWO_OK && w.conf < 75f) return null to Trust.DOUBT
+            if (k.length == 3 && (lex.rankOf(k) ?: Int.MAX_VALUE) > 20_000 && w.conf < 60f) return null to Trust.DOUBT
+            // «де» вместо «не», редкие «слова» вроде «такои», «выв» (опечатки из интернета) — сомнительно
+            val rank = lex.rankOf(k) ?: Int.MAX_VALUE
+            val rare = (k.length == 2 && k !in TWO_OK) || (k.length == 3 && rank > 20_000) || rank > 60_000
+            return w to (if (rare) Trust.DOUBT else Trust.SURE)
         }
         if (w.conf >= 60f) {
-            // Уверенно, но нет в словаре: имя, редкое слово — или слипшиеся «непозволю»
-            glueSplit(lex, k)?.let { return w.copy(text = replaceCore(w.text, c, it)) }
-            return w
+            // Уверенно, но нет в словаре: имя, редкое слово — или слипшиеся «непозволю», «выв».
+            // Быстрая модель часто склеивает слова уверенно, поэтому такое слово всегда сомнительно.
+            glueSplit(lex, k)?.let { return w.copy(text = replaceCore(w.text, c, it)) to Trust.DOUBT }
+            return w to Trust.DOUBT
         }
         val fixed = lex.correct(k) ?: glueSplit(lex, k)
-        if (fixed != null) return w.copy(text = replaceCore(w.text, c, fixed))
-        return if (w.conf >= 30f && c.length >= 4) w else null
+        if (fixed != null) return w.copy(text = replaceCore(w.text, c, fixed)) to Trust.DOUBT
+        return (if (w.conf >= 30f && c.length >= 4) w else null) to Trust.DOUBT
     }
 
     /** Разделить слипшиеся слова, только если одна часть — служебное слово. */
@@ -215,11 +222,31 @@ object TextLayout {
      * Пузырь уже очищен от контура и рисунка, а слова проверяются по словарю, поэтому
      * неуверенно прочитанное, но настоящее слово не теряется.
      */
-    fun blockPhrase(rawWords: List<OcrWord>, box: Box): Phrase? {
+    fun blockPhrase(rawWords: List<OcrWord>, box: Box): Phrase? = blockPhraseChecked(rawWords, box).phrase
+
+    /** Есть ли среди распознанного хоть что-то похожее на слова (иначе это обрывок рисунка). */
+    fun looksLikeText(rawWords: List<OcrWord>): Boolean {
+        val lex = lexicon
+        var score = 0
+        for (w in rawWords) {
+            val c = core(cleanWord(w.text))
+            if (c.length < 2 || c.count { isCyr(it) } < c.count { it.isLetter() } * 0.6) continue
+            if (c.length >= 3 && (lex == null || c in lex)) score += 2
+            else if (w.conf >= 50f) score += 1
+        }
+        return score >= 2
+    }
+
+    /** Реплика и признак «сомнительно»: тогда её стоит перечитать точной моделью. */
+    class Checked(val phrase: Phrase?, val doubtful: Boolean)
+
+    fun blockPhraseChecked(rawWords: List<OcrWord>, box: Box): Checked {
+        val withLetters = rawWords.count { w -> w.text.any { it.isLetter() } }
         val cleaned = mergeHyphenated(
             rawWords.map { it.copy(text = cleanWord(it.text)) }.filter { w -> w.text.any { it.isLetter() } }
         )
-        if (cleaned.isEmpty()) return null
+        if (cleaned.isEmpty()) return Checked(null, withLetters > 0)
+        var doubtful = false
         val heights = cleaned.map { it.box.height }.sorted()
         val med = heights[heights.size / 2].toDouble()
         val kept = ArrayList<OcrWord>()
@@ -227,32 +254,37 @@ object TextLayout {
             val t = w.text
             val letters = t.count { it.isLetter() }
             val cyr = t.count { isCyr(it) }
-            if (cyr < letters * 0.6) continue
-            if (cleaned.size >= 3 && (w.box.height > med * 2.3 || w.box.height < med * 0.35)) continue
+            if (cyr < letters * 0.6) { doubtful = true; continue }
+            if (cleaned.size >= 3 && (w.box.height > med * 2.3 || w.box.height < med * 0.35)) { doubtful = true; continue }
             val lc = t.lowercase().filter { it.isLetter() }
             if (lc.length == 1) {
-                if (lc in SINGLE_OK && w.conf >= 20f) kept += w
+                if (lc in SINGLE_OK && w.conf >= 20f) kept += w else doubtful = true
+                if (w.conf < 60f) doubtful = true
                 continue
             }
-            if (lc.length >= 4 && lc.toSet().size == 1) continue
-            checkWord(w)?.let { kept += it }
+            if (lc.length >= 4 && lc.toSet().size == 1) { doubtful = true; continue }
+            val (cw, trust) = checkWord(w)
+            if (trust == Trust.DOUBT) doubtful = true
+            cw?.let { kept += it }
         }
-        if (kept.isEmpty()) return null
+        if (kept.isEmpty()) return Checked(null, true)
         val letters = kept.sumOf { w -> w.text.count { it.isLetter() } }
-        if (letters < 2) return null
+        if (letters < 2) return Checked(null, true)
         if (kept.size == 1) {
             val lc = kept[0].text.lowercase().filter { it.isLetter() }
-            if (lc.length <= 2 && (lc !in SHORT_OK || kept[0].conf < 70f)) return null
+            if (lc.length <= 2 && (lc !in SHORT_OK || kept[0].conf < 70f)) return Checked(null, true)
         }
         // Мусор с рисунка: почти ничего не похоже на слова, и распознано неуверенно
         val lex = lexicon
         if (lex != null) {
             val known = kept.sumOf { w -> val c = core(w.text); if (c in lex) c.length else 0 }
-            if (known < letters * 0.35 && kept.map { it.conf }.average() < 55) return null
+            if (known < letters * 0.35 && kept.map { it.conf }.average() < 55) return Checked(null, true)
         }
         val text = joinLines(kept)
-        if (text.isBlank()) return null
-        return Phrase(text, box, kept.map { it.conf }.average())
+        if (text.isBlank()) return Checked(null, true)
+        val conf = kept.map { it.conf }.average()
+        if (conf < 70) doubtful = true
+        return Checked(Phrase(text, box, conf), doubtful)
     }
 
     /**
@@ -453,6 +485,14 @@ class TextMemory(private val screensWindow: Int = 3) {
 
     @Synchronized
     fun seen(s: String): Boolean = unread(s) == null
+
+    /** Забыть реплику (её не успели прочитать — например, нажали паузу). */
+    @Synchronized
+    fun remove(s: String) {
+        val n = norm(s)
+        val i = items.indexOfLast { it.norm == n }
+        if (i >= 0) items.removeAt(i)
+    }
 
     @Synchronized
     fun add(s: String) {

@@ -26,6 +26,64 @@ class Prepared(
     val cutAtBottom: List<Box>
 )
 
+/**
+ * Узнаёт пузыри, уже распознанные на прошлых экранах: после прокрутки это те же картинки,
+ * просто выше. Сравниваются размер и «отпечаток» — сетка средних яркостей внутри пузыря.
+ * Так уже прочитанные пузыри (они вверху экрана) не задерживают распознавание новых.
+ */
+class BubbleCache(private val capacity: Int = 40) {
+    class Hit(val phrase: Phrase?)
+
+    private class Entry(val w: Int, val h: Int, val sig: IntArray, val phrase: Phrase?)
+
+    private val items = ArrayList<Entry>()
+
+    fun signature(p: Prepared, b: Bubble): IntArray {
+        val bx = b.box
+        val sums = IntArray(GX * GY)
+        val cnt = IntArray(GX * GY)
+        var y = bx.top
+        while (y < bx.bottom) {
+            val cy = (y - bx.top) * GY / bx.height
+            var x = bx.left
+            while (x < bx.right) {
+                val v = if (b.inside(x, y)) p.gray[y * p.w + x] else 255
+                val i = cy * GX + (x - bx.left) * GX / bx.width
+                sums[i] += v
+                cnt[i]++
+                x += 2
+            }
+            y += 2
+        }
+        return IntArray(GX * GY) { if (cnt[it] > 0) sums[it] / cnt[it] else 255 }
+    }
+
+    @Synchronized
+    fun find(b: Bubble, sig: IntArray): Hit? {
+        for (e in items.asReversed()) {
+            if (kotlin.math.abs(e.w - b.box.width) > 4 || kotlin.math.abs(e.h - b.box.height) > 4) continue
+            var d = 0
+            for (i in sig.indices) d += kotlin.math.abs(sig[i] - e.sig[i])
+            if (d < sig.size * 5) return Hit(e.phrase?.copy(box = b.box))
+        }
+        return null
+    }
+
+    @Synchronized
+    fun put(b: Bubble, sig: IntArray, phrase: Phrase?) {
+        items += Entry(b.box.width, b.box.height, sig, phrase)
+        if (items.size > capacity) items.removeAt(0)
+    }
+
+    @Synchronized
+    fun clear() = items.clear()
+
+    private companion object {
+        const val GX = 24
+        const val GY = 12
+    }
+}
+
 /** Найденный быстрой моделью текст и вырезка вокруг него — для уточнения точной моделью. */
 class Candidate(val phrase: Phrase, val crop: GrayImage, val x0: Int, val y0: Int)
 
@@ -88,6 +146,37 @@ object ScreenText {
         }
         return res.sortedWith(compareBy({ it.box.top }, { it.box.left }))
     }
+
+    /** Результат первого (быстрого) прочтения пузыря. */
+    class BubbleRead(val bubble: Bubble, val crop: Candidate, val checked: TextLayout.Checked, val textLike: Boolean) {
+        /** Перечитать точной моделью: результат сомнительный, но в пузыре похоже есть текст. */
+        val needsSecondPass get() = checked.doubtful && (checked.phrase != null || textLike)
+    }
+
+    /** Первый проход: пузырь быстрой моделью. */
+    fun bubbleFirstPass(p: Prepared, b: Bubble, ocr: OcrFn): BubbleRead {
+        val c = bubbleImage(p, b)
+        val words = ocr.read(c.crop).map { shift(it, c.x0, c.y0) }
+        return BubbleRead(b, c, TextLayout.blockPhraseChecked(words, b.box), TextLayout.looksLikeText(words))
+    }
+
+    /** Второй проход для сомнительного пузыря: точная модель. */
+    fun bubbleSecondPass(r: BubbleRead, best: OcrFn): Phrase? {
+        val words = best.read(r.crop.crop).map { shift(it, r.crop.x0, r.crop.y0) }
+        return TextLayout.blockPhraseChecked(words, r.bubble.box).phrase ?: r.checked.phrase
+    }
+
+    /** Пузыри: быстрой моделью, сомнительные — ещё раз точной (последовательно, для проверок). */
+    fun readBubblesAdaptive(p: Prepared, fast: OcrFn, best: OcrFn, cache: BubbleCache? = null): List<Phrase> =
+        p.bubbles.sortedBy { it.box.top }.mapNotNull { b ->
+            val sig = cache?.signature(p, b)
+            val hit = if (cache != null && sig != null) cache.find(b, sig) else null
+            if (hit != null) return@mapNotNull hit.phrase
+            val r = bubbleFirstPass(p, b, fast)
+            val ph = if (r.needsSecondPass) bubbleSecondPass(r, best) else r.checked.phrase
+            if (cache != null && sig != null) cache.put(b, sig, ph)
+            ph
+        }
 
     // ---------------- Остальной экран ----------------
 
