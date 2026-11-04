@@ -2,6 +2,9 @@ package com.manhwavoice.reader
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.animation.ObjectAnimator
+import android.animation.PropertyValuesHolder
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.SharedPreferences
@@ -19,6 +22,7 @@ import android.util.Log
 import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
@@ -552,13 +556,17 @@ class ReaderService : AccessibilityService() {
         val screenH = wm.currentWindowMetrics.bounds.height()
         val tv = TextView(this).apply {
             text = ICON_PLAY
-            textSize = 22f
+            textSize = 21f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
+            setShadowLayer(4f, 0f, 1f, 0x66000000)
+            // Градиент в цветах приложения: фиолетовый → розовый
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xF27C3AED.toInt(), 0xF2DB2777.toInt())
+            ).apply {
                 shape = GradientDrawable.OVAL
-                setColor(0xCC2B2140.toInt())
-                setStroke((2 * dp).toInt(), 0xAAFFD54F.toInt())
+                setStroke((2 * dp).toInt(), 0x66FFFFFF)
             }
         }
         val lp = WindowManager.LayoutParams(
@@ -624,11 +632,36 @@ class ReaderService : AccessibilityService() {
         return Rect(loc[0] - 10, loc[1] - 10, loc[0] + b.width + 10, loc[1] + b.height + 10)
     }
 
+    private var shownState: State? = null
+    private var stateAnim: ValueAnimator? = null
+
+    /** Значок и анимация кнопки: ▶ ожидание, ⋯ мигает — распознаёт, ❚❚ пульсирует — читает. */
     private fun setState(s: State) {
-        button?.text = when (s) {
+        val b = button ?: return
+        if (s == shownState) return
+        shownState = s
+        b.text = when (s) {
             State.IDLE -> ICON_PLAY
             State.BUSY -> ICON_BUSY
             State.SPEAKING -> ICON_PAUSE
+        }
+        stateAnim?.cancel()
+        stateAnim = null
+        b.scaleX = 1f
+        b.scaleY = 1f
+        b.alpha = 1f
+        stateAnim = when (s) {
+            State.SPEAKING -> ObjectAnimator.ofPropertyValuesHolder(
+                b,
+                PropertyValuesHolder.ofFloat(View.SCALE_X, 1f, 0.88f),
+                PropertyValuesHolder.ofFloat(View.SCALE_Y, 1f, 0.88f)
+            ).apply { duration = 700 }
+            State.BUSY -> ObjectAnimator.ofFloat(b, View.ALPHA, 1f, 0.55f).apply { duration = 500 }
+            State.IDLE -> null
+        }?.apply {
+            repeatCount = ValueAnimator.INFINITE
+            repeatMode = ValueAnimator.REVERSE
+            start()
         }
     }
 

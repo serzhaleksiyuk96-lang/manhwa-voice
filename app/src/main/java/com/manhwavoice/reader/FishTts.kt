@@ -36,10 +36,10 @@ object FishTts {
         if (p.getBoolean(Prefs.KEY_FISH_FREE, true)) MODEL_FREE else MODEL_PAID
 
     /** Синтезирует фразу в mp3-файл. Блокирующий вызов — не из главного потока. */
-    fun synthesize(context: Context, p: SharedPreferences, text: String): File {
+    fun synthesize(context: Context, p: SharedPreferences, text: String, voiceOverride: String? = null): File {
         val key = p.getString(Prefs.KEY_FISH_KEY, "").orEmpty().trim()
         if (key.isEmpty()) throw FishError("не указан API-ключ Fish Audio (раздел «Голос»)")
-        val voice = normalizeVoiceId(p.getString(Prefs.KEY_FISH_VOICE, "").orEmpty())
+        val voice = normalizeVoiceId(voiceOverride ?: p.getString(Prefs.KEY_FISH_VOICE, "").orEmpty())
 
         val body = JSONObject().apply {
             put("text", text)
