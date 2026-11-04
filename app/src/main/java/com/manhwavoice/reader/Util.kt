@@ -109,7 +109,7 @@ object Voices {
         } else if (name == null && tts.voice?.locale?.language != "ru") {
             tts.setLanguage(RU)
         }
-        tts.setPitch(pitch(p))
+        tts.setPitch(Prefs.pitch(p))
         tts.setSpeechRate(Prefs.rate(p))
     }
 }
