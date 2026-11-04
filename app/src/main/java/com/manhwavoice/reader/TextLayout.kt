@@ -25,6 +25,8 @@ object TextLayout {
     private val CYR = Regex("[А-Яа-яЁё]")
     // Однобуквенные русские слова, которые стоит оставлять
     private val SINGLE_OK = setOf("и", "а", "в", "я", "с", "к", "у", "о", "ж", "б")
+    // Короткие реплики из одного слова, которые можно читать (остальное из 1–2 букв — обычно мусор)
+    private val SHORT_OK = setOf("да", "не", "ну", "эй", "ох", "ах", "ой", "но", "ха", "ты", "он", "мы", "вы", "я", "а", "о", "и", "уф", "ух", "ага", "эх")
 
     /** Оставляем только похожее на русский текст, мусор с рисунка отбрасываем. */
     private const val KEEP_PUNCT = ".,!?…-—–:;\"'«»()"
@@ -36,7 +38,7 @@ object TextLayout {
         val t = w.text.trim()
         if (t.isEmpty()) return false
         val h = w.box.height
-        if (h < 10 || h > screenH * 0.12) return false
+        if (h < 10 || h > screenH * 0.09) return false
         val letters = t.count { it.isLetter() }
         if (letters == 0) return false
         val cyr = CYR.findAll(t).count()
@@ -92,6 +94,10 @@ object TextLayout {
             if (letters < 2) continue
             if (meanConf < 55.0) continue
             if (g.size == 1 && g[0].conf < 70f) continue
+            if (g.size == 1) {
+                val core = g[0].text.lowercase().filter { it.isLetter() }
+                if (core.length <= 2 && core !in SHORT_OK) continue
+            }
             if (topCutLimit != null && box.top < topCutLimit) continue
             if (bottomCutLimit != null && box.bottom > bottomCutLimit) continue
             val text = joinLines(g)

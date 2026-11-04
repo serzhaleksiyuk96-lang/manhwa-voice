@@ -86,22 +86,20 @@ class OcrEngine(private val context: Context) {
         val wordsA = runTess(t, work)
         val phrasesA = TextLayout.buildPhrases(wordsA, h, topLimit, bottomLimit)
 
+        val argb = IntArray(w * h)
+        work.getPixels(argb, 0, w, 0, 0, w, h)
+        val gray = IntArray(argb.size) { i ->
+            val p = argb[i]
+            (Color.red(p) * 30 + Color.green(p) * 59 + Color.blue(p) * 11) / 100
+        }
+
         // Проход 2: контурный шрифт (тёмные буквы с белой обводкой на тёмном фоне)
         var phrasesB = emptyList<Phrase>()
         try {
-            val argb = IntArray(w * h)
-            work.getPixels(argb, 0, w, 0, 0, w, h)
-            val gray = IntArray(argb.size) { i ->
-                val p = argb[i]
-                (Color.red(p) * 30 + Color.green(p) * 59 + Color.blue(p) * 11) / 100
-            }
             val fixed = OutlineFix.process(gray, w, h).pixels
             if (fixed != null) {
-                for (i in fixed.indices) {
-                    val v = fixed[i]
-                    argb[i] = Color.rgb(v, v, v)
-                }
-                val bmpB = Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888)
+                val px = IntArray(fixed.size) { val v = fixed[it]; Color.rgb(v, v, v) }
+                val bmpB = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
                 val wordsB = runTess(t, bmpB)
                 bmpB.recycle()
                 phrasesB = TextLayout.buildPhrases(wordsB, h, topLimit, bottomLimit)
@@ -109,10 +107,38 @@ class OcrEngine(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "outline pass failed", e)
         }
+
+        // Проход 3: каждый речевой пузырь отдельно — яркая картинка вокруг не мешает
+        var phrasesC = emptyList<Phrase>()
+        try {
+            val bubbles = BubbleFinder.find(gray, w, h)
+            if (bubbles.isNotEmpty()) {
+                val wordsC = ArrayList<OcrWord>()
+                t.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK)
+                for (b in bubbles) {
+                    val m = 8
+                    val x0 = (b.left - m).coerceAtLeast(0)
+                    val y0 = (b.top - m).coerceAtLeast(0)
+                    val x1 = (b.right + m).coerceAtMost(w)
+                    val y1 = (b.bottom + m).coerceAtMost(h)
+                    val crop = Bitmap.createBitmap(work, x0, y0, x1 - x0, y1 - y0)
+                    for (wd in runTess(t, crop)) {
+                        val bx = wd.box
+                        wordsC += wd.copy(box = Box(bx.left + x0, bx.top + y0, bx.right + x0, bx.bottom + y0))
+                    }
+                    if (crop != work) crop.recycle()
+                }
+                phrasesC = TextLayout.buildPhrases(wordsC, h, topLimit, bottomLimit)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "bubble pass failed", e)
+        } finally {
+            t.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
+        }
         work.recycle()
 
-        val phrases = TextLayout.mergePhrases(phrasesA, phrasesB)
-        Log.d(TAG, "A=${phrasesA.map { it.text }} B=${phrasesB.map { it.text }} -> ${phrases.map { it.text }}")
+        val phrases = TextLayout.mergePhrases(TextLayout.mergePhrases(phrasesA, phrasesB), phrasesC)
+        Log.d(TAG, "A=${phrasesA.map { it.text }} B=${phrasesB.map { it.text }} C=${phrasesC.map { it.text }} -> ${phrases.map { it.text }}")
         return phrases
     }
 

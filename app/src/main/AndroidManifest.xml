@@ -10,6 +10,15 @@
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
+        <!-- Чтобы отличать обычные приложения от всплывающих панелей (скриншот и т.п.) -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
     </queries>
 
     <application

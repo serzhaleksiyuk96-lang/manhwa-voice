@@ -3,6 +3,7 @@ package com.manhwavoice.reader
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -92,12 +93,23 @@ class ReaderService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: return
         if (pkg == packageName || pkg == "com.android.systemui") return
         if (event.className?.toString()?.contains("InputMethod") == true) return
+        // Панели скриншота, шторка, всплывающие окна — не настоящие приложения, их пропускаем
+        if (!isRealApp(pkg)) return
         foregroundPkg = pkg
         // Ушли из браузера (домой, в другое приложение) — ставим на паузу, чтобы не листать чужое
         val rp = readingPkg
         if (loopJob?.isActive == true && rp != null && pkg != rp) {
             stopReading("Пауза: вы вышли из браузера")
         }
+    }
+
+    private val realAppCache = HashMap<String, Boolean>()
+
+    /** Обычное приложение со значком или главный экран (а не панель скриншота и т.п.). */
+    private fun isRealApp(pkg: String): Boolean = realAppCache.getOrPut(pkg) {
+        if (packageManager.getLaunchIntentForPackage(pkg) != null) return@getOrPut true
+        val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        packageManager.queryIntentActivities(home, 0).any { it.activityInfo?.packageName == pkg }
     }
 
     override fun onInterrupt() {
