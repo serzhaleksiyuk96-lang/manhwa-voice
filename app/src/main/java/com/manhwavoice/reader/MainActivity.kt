@@ -113,8 +113,8 @@ class MainActivity : Activity() {
         text("Настройки", 18f, bold = true, top = 22)
         slider("Скорость речи", Prefs.KEY_RATE, 50, 200, 100) { "$it%" }
         slider("Шаг прокрутки", Prefs.KEY_SCROLL, 40, 75, 60) { "$it% экрана" }
-        slider("Пауза после текста", Prefs.KEY_PAUSE_TEXT, 0, 3000, 300) { String.format(Locale.US, "%.1f с", it / 1000f) }
-        slider("Пауза на кадрах без текста", Prefs.KEY_PAUSE_EMPTY, 200, 4000, 800) { String.format(Locale.US, "%.1f с", it / 1000f) }
+        slider("Пауза после текста", Prefs.KEY_PAUSE_TEXT, 0, 3000, Prefs.DEFAULT_PAUSE_TEXT) { String.format(Locale.US, "%.1f с", it / 1000f) }
+        slider("Пауза на кадрах без текста", Prefs.KEY_PAUSE_EMPTY, 200, 4000, Prefs.DEFAULT_PAUSE_EMPTY) { String.format(Locale.US, "%.1f с", it / 1000f) }
 
         text("Голос", 18f, bold = true, top = 22)
         engineButton = button("Движок: …") { chooseEngine() }

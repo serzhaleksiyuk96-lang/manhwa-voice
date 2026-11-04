@@ -19,9 +19,12 @@ object Prefs {
     /** Шаг прокрутки в % высоты экрана, 40..75 */
     fun scrollFraction(p: SharedPreferences) = p.getInt(KEY_SCROLL, 60) / 100f
     /** Пауза после прочитанного экрана, мс */
-    fun pauseAfterSpeech(p: SharedPreferences) = p.getInt(KEY_PAUSE_TEXT, 300).toLong()
+    fun pauseAfterSpeech(p: SharedPreferences) = p.getInt(KEY_PAUSE_TEXT, DEFAULT_PAUSE_TEXT).toLong()
     /** Пауза на экране без текста, мс */
-    fun pauseNoText(p: SharedPreferences) = p.getInt(KEY_PAUSE_EMPTY, 800).toLong()
+    fun pauseNoText(p: SharedPreferences) = p.getInt(KEY_PAUSE_EMPTY, DEFAULT_PAUSE_EMPTY).toLong()
+
+    const val DEFAULT_PAUSE_TEXT = 200
+    const val DEFAULT_PAUSE_EMPTY = 600
 
     /** Высота голоса, 50..200 (%) */
     fun pitch(p: SharedPreferences) = p.getInt(KEY_PITCH, 100) / 100f

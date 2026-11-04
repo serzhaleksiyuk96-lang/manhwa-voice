@@ -16,6 +16,9 @@ object OutlineFix {
 
     class Result(val pixels: IntArray?, val backgroundShare: Float, val bodyComponents: Int)
 
+    /** Контурный шрифт ищем только на тёмных экранах: фон должен занимать хотя бы такую долю */
+    const val MIN_BACKGROUND = 0.3f
+
     /**
      * @param gray яркость 0..255, построчно, размер w*h
      * @return pixels — 0 (чернила) или 255 (бумага), либо null, если на экране нет такого текста
@@ -55,7 +58,7 @@ object OutlineFix {
         var bgPixels = 0
         for (p in 0 until n) if (isBorder[label[p]]) bgPixels++
         val bgShare = bgPixels / n.toFloat()
-        if (bgShare < 0.15f) return Result(null, bgShare, 0)
+        if (bgShare < MIN_BACKGROUND) return Result(null, bgShare, 0)
 
         // 3) Толщина обводки: медиана белых горизонтальных отрезков между тёмными
         val hist = IntArray(41)

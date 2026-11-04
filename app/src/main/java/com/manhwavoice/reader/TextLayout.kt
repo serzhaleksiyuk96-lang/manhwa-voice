@@ -38,7 +38,7 @@ object TextLayout {
         val t = w.text.trim()
         if (t.isEmpty()) return false
         val h = w.box.height
-        if (h < 10 || h > screenH * 0.09) return false
+        if (h < 10 || h > screenH * 0.07) return false
         val letters = t.count { it.isLetter() }
         if (letters == 0) return false
         val cyr = CYR.findAll(t).count()
@@ -124,7 +124,7 @@ object TextLayout {
         return result.sortedWith(compareBy({ it.box.top }, { it.box.left }))
     }
 
-    private fun intersects(a: Box, b: Box) =
+    fun intersects(a: Box, b: Box) =
         a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 
     /** Склеивает слова одной реплики построчно, слева направо. */

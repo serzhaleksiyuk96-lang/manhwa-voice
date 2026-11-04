@@ -22,12 +22,14 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Скачать модель русского языка для Tesseract
+      - name: Скачать модели русского языка для Tesseract (точная и быстрая)
         run: |
-          mkdir -p app/src/main/assets/tessdata
+          mkdir -p app/src/main/assets/tessdata app/src/main/assets/tessdata_fast
           curl -fL -o app/src/main/assets/tessdata/rus.traineddata \
             https://github.com/tesseract-ocr/tessdata_best/raw/main/rus.traineddata
-          ls -la app/src/main/assets/tessdata
+          curl -fL -o app/src/main/assets/tessdata_fast/rus.traineddata \
+            https://github.com/tesseract-ocr/tessdata_fast/raw/main/rus.traineddata
+          ls -la app/src/main/assets/tessdata app/src/main/assets/tessdata_fast
 
       - name: Собрать APK
         run: |

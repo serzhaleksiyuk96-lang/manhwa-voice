@@ -44,7 +44,7 @@ object FishTts {
         val body = JSONObject().apply {
             put("text", text)
             put("format", "mp3")
-            put("mp3_bitrate", 128)
+            put("mp3_bitrate", 64)   // речь — хватает и 64 кбит/с, скачивается вдвое быстрее
             put("latency", "balanced")
             put("normalize", true)
             put("language", "ru")
