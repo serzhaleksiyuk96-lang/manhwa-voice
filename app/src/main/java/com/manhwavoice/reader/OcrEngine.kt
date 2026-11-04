@@ -79,9 +79,47 @@ class OcrEngine(private val context: Context) {
             canvas.drawRect(it.left * scale, it.top * scale, it.right * scale, it.bottom * scale, white)
         }
 
+        val topLimit = if (skipTopCut) (statusBarPx * scale + h * 0.015f).roundToInt() else null
+        val bottomLimit = if (skipBottomCut) (h * 0.94f).roundToInt() else null
+
+        // Проход 1: картинка как есть (обычные пузыри, белый текст на тёмном)
+        val wordsA = runTess(t, work)
+        val phrasesA = TextLayout.buildPhrases(wordsA, h, topLimit, bottomLimit)
+
+        // Проход 2: контурный шрифт (тёмные буквы с белой обводкой на тёмном фоне)
+        var phrasesB = emptyList<Phrase>()
+        try {
+            val argb = IntArray(w * h)
+            work.getPixels(argb, 0, w, 0, 0, w, h)
+            val gray = IntArray(argb.size) { i ->
+                val p = argb[i]
+                (Color.red(p) * 30 + Color.green(p) * 59 + Color.blue(p) * 11) / 100
+            }
+            val fixed = OutlineFix.process(gray, w, h).pixels
+            if (fixed != null) {
+                for (i in fixed.indices) {
+                    val v = fixed[i]
+                    argb[i] = Color.rgb(v, v, v)
+                }
+                val bmpB = Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888)
+                val wordsB = runTess(t, bmpB)
+                bmpB.recycle()
+                phrasesB = TextLayout.buildPhrases(wordsB, h, topLimit, bottomLimit)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "outline pass failed", e)
+        }
+        work.recycle()
+
+        val phrases = TextLayout.mergePhrases(phrasesA, phrasesB)
+        Log.d(TAG, "A=${phrasesA.map { it.text }} B=${phrasesB.map { it.text }} -> ${phrases.map { it.text }}")
+        return phrases
+    }
+
+    private fun runTess(t: TessBaseAPI, bmp: Bitmap): List<OcrWord> {
         val words = ArrayList<OcrWord>()
         try {
-            t.setImage(work)
+            t.setImage(bmp)
             t.getUTF8Text()   // запускает распознавание
             val it = t.getResultIterator()
             if (it != null) {
@@ -100,14 +138,8 @@ class OcrEngine(private val context: Context) {
             Log.e(TAG, "OCR failed", e)
         } finally {
             t.clear()
-            work.recycle()
         }
-
-        val topLimit = if (skipTopCut) (statusBarPx * scale + h * 0.015f).roundToInt() else null
-        val bottomLimit = if (skipBottomCut) (h * 0.94f).roundToInt() else null
-        val phrases = TextLayout.buildPhrases(words, h, topLimit, bottomLimit)
-        Log.d(TAG, "words=${words.size} phrases=${phrases.map { it.text }}")
-        return phrases
+        return words
     }
 
     fun release() {

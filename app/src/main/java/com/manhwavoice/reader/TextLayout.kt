@@ -18,7 +18,7 @@ data class Box(val left: Int, val top: Int, val right: Int, val bottom: Int) {
 
 data class OcrWord(val text: String, val box: Box, val conf: Float)
 
-data class Phrase(val text: String, val box: Box)
+data class Phrase(val text: String, val box: Box, val conf: Double = 0.0)
 
 object TextLayout {
 
@@ -27,6 +27,11 @@ object TextLayout {
     private val SINGLE_OK = setOf("и", "а", "в", "я", "с", "к", "у", "о", "ж", "б")
 
     /** Оставляем только похожее на русский текст, мусор с рисунка отбрасываем. */
+    private const val KEEP_PUNCT = ".,!?…-—–:;\"'«»()"
+
+    /** Убирает из слова посторонние значки (©, @, | и т.п.), которые OCR находит в рисунке. */
+    fun cleanWord(s: String): String = s.trim().filter { it.isLetterOrDigit() || it in KEEP_PUNCT }
+
     fun keepWord(w: OcrWord, screenH: Int): Boolean {
         val t = w.text.trim()
         if (t.isEmpty()) return false
@@ -59,7 +64,7 @@ object TextLayout {
         topCutLimit: Int?,      // если не null — пропускаем реплики, обрезанные сверху
         bottomCutLimit: Int?    // если не null — пропускаем реплики, обрезанные снизу
     ): List<Phrase> {
-        val words = rawWords.filter { keepWord(it, screenH) }
+        val words = rawWords.map { it.copy(text = cleanWord(it.text)) }.filter { keepWord(it, screenH) }
         if (words.isEmpty()) return emptyList()
 
         // Объединение близких слов (система непересекающихся множеств)
@@ -90,10 +95,31 @@ object TextLayout {
             if (topCutLimit != null && box.top < topCutLimit) continue
             if (bottomCutLimit != null && box.bottom > bottomCutLimit) continue
             val text = joinLines(g)
-            if (text.isNotBlank()) phrases += Phrase(text, box)
+            if (text.isNotBlank()) phrases += Phrase(text, box, meanConf)
         }
         return phrases.sortedWith(compareBy({ it.box.top }, { it.box.left }))
     }
+
+    /**
+     * Объединяет результаты двух проходов распознавания (обычная картинка и обработанная
+     * для контурного шрифта). Если реплики пересекаются, берём ту, в которой OCR увереннее.
+     */
+    fun mergePhrases(a: List<Phrase>, b: List<Phrase>): List<Phrase> {
+        val result = a.toMutableList()
+        for (pb in b) {
+            val overlapping = result.filter { intersects(it.box, pb.box) }
+            if (overlapping.isEmpty()) {
+                result += pb
+            } else if (pb.conf + 3 >= overlapping.maxOf { it.conf }) {
+                result.removeAll(overlapping)
+                result += pb
+            }
+        }
+        return result.sortedWith(compareBy({ it.box.top }, { it.box.left }))
+    }
+
+    private fun intersects(a: Box, b: Box) =
+        a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 
     /** Склеивает слова одной реплики построчно, слева направо. */
     fun joinLines(g: List<OcrWord>): String {
