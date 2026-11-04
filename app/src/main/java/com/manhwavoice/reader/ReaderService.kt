@@ -210,13 +210,16 @@ class ReaderService : AccessibilityService() {
 
     // ---------------- Озвучка реплик по порядку ----------------
 
+    /** Что произнести ([say] — вся реплика или её непрочитанное продолжение) и что запомнить. */
+    private class Utterance(val say: String, val remember: String)
+
     /**
      * Озвучивает реплики по мере их появления. [produce] выдаёт реплики по порядку,
      * следующая берётся, когда предыдущая уже звучит (для Fish Audio — скачивается заранее).
      * Возвращает число прочитанных реплик.
      */
-    private suspend fun speakOrdered(produce: suspend (suspend (String) -> Unit) -> Unit): Int = coroutineScope {
-        val ch = Channel<String>(Channel.RENDEZVOUS)
+    private suspend fun speakOrdered(produce: suspend (suspend (Utterance) -> Unit) -> Unit): Int = coroutineScope {
+        val ch = Channel<Utterance>(Channel.RENDEZVOUS)
         launch {
             try {
                 produce { ch.send(it) }
@@ -231,23 +234,23 @@ class ReaderService : AccessibilityService() {
      * Системный голос: следующая реплика ставится в очередь синтеза, пока звучит текущая, —
      * так между репликами нет лишней паузы.
      */
-    private suspend fun consumeSystem(ch: ReceiveChannel<String>): Int {
-        val inFlight = ArrayDeque<Pair<String, CompletableDeferred<Boolean>?>>()
+    private suspend fun consumeSystem(ch: ReceiveChannel<Utterance>): Int {
+        val inFlight = ArrayDeque<Pair<Utterance, CompletableDeferred<Boolean>?>>()
         var n = 0
-        for (t in ch) {
+        for (u in ch) {
             setState(State.SPEAKING)
-            inFlight.addLast(t to submit(t))
+            inFlight.addLast(u to submit(u.say))
             if (inFlight.size >= 2) {
-                val (text, done) = inFlight.removeFirst()
-                awaitSpeech(done)
-                memory.add(text)
+                val (done, d) = inFlight.removeFirst()
+                awaitSpeech(d)
+                memory.add(done.remember)
                 n++
             }
         }
         while (inFlight.isNotEmpty()) {
-            val (text, done) = inFlight.removeFirst()
-            awaitSpeech(done)
-            memory.add(text)
+            val (done, d) = inFlight.removeFirst()
+            awaitSpeech(d)
+            memory.add(done.remember)
             n++
         }
         return n
@@ -257,12 +260,12 @@ class ReaderService : AccessibilityService() {
      * Fish Audio: следующие реплики (до трёх) скачиваются заранее, пока звучит текущая.
      * Если Fish Audio недоступен, реплика читается системным голосом.
      */
-    private suspend fun consumeFish(ch: ReceiveChannel<String>): Int = coroutineScope {
-        val queue = ArrayDeque<Pair<String, Deferred<File?>>>()
+    private suspend fun consumeFish(ch: ReceiveChannel<Utterance>): Int = coroutineScope {
+        val queue = ArrayDeque<Pair<Utterance, Deferred<File?>>>()
         var closed = false
         var n = 0
-        fun enqueue(t: String) {
-            queue.addLast(t to async(Dispatchers.IO) { fishSynth(t) })
+        fun enqueue(u: Utterance) {
+            queue.addLast(u to async(Dispatchers.IO) { fishSynth(u.say) })
         }
         fun topUp() {
             while (!closed && queue.size < FISH_PREFETCH) {
@@ -284,20 +287,20 @@ class ReaderService : AccessibilityService() {
                 enqueue(r.getOrThrow())
                 continue
             }
-            val (text, job) = queue.removeFirst()
+            val (u, job) = queue.removeFirst()
             val file = job.await()
             topUp()
             setState(State.SPEAKING)
             if (file != null) {
                 try {
-                    if (!FishTts.play(file)) speak(text)
+                    if (!FishTts.play(file)) speak(u.say)
                 } finally {
                     file.delete()
                 }
             } else {
-                speak(text)
+                speak(u.say)
             }
-            memory.add(text)
+            memory.add(u.remember)
             n++
         }
         n
@@ -317,37 +320,41 @@ class ReaderService : AccessibilityService() {
     }
 
     /**
-     * Распознаёт экран и озвучивает текст. Пузыри (точная модель) читаются сразу,
-     * остальной экран (быстрая модель) обрабатывается параллельно и вставляется
-     * по порядку сверху вниз, как только готов.
+     * Распознаёт экран и озвучивает текст. Пузыри (точная модель, без контура и рисунка)
+     * читаются сразу; остальной экран параллельно ищется быстрой моделью, уточняется точной
+     * и вставляется по порядку сверху вниз.
      * Возвращает число прочитанных реплик или -1, если экран пустой.
+     * [newScreen] = false — тот же экран читается ещё раз (в конце главы).
      */
     private suspend fun readScreen(
         shot: Bitmap,
         excl: Rect?,
         statusBar: Int,
         skipTopCut: Boolean,
-        skipBottomCut: Boolean
+        skipBottomCut: Boolean,
+        newScreen: Boolean = true
     ): Int {
-        val frame = try {
+        val prep = try {
             withContext(Dispatchers.Default) { ocr.prepare(shot, excl, statusBar, skipTopCut, skipBottomCut) }
         } finally {
             shot.recycle()
         }
-        if (frame.blank) {
-            frame.crops.forEach { it.third.recycle() }
-            frame.work.recycle()
-            return -1
-        }
+        if (newScreen) memory.nextScreen()
+        if (prep.blank) return -1
         return coroutineScope {
-            val rest = async(ocr.fastDispatcher) { ocr.recognizeRest(frame) }
-            val bubbles = withContext(ocr.bestDispatcher) { ocr.recognizeBubbles(frame) }
+            val rest = async {
+                val cands = withContext(ocr.fastDispatcher) { ocr.detectRest(prep) }
+                if (cands.isEmpty()) emptyList() else withContext(ocr.bestDispatcher) { ocr.refine(cands) }
+            }
+            val bubbles = withContext(ocr.bestDispatcher) { ocr.readBubbles(prep) }
             speakOrdered { emit ->
                 val local = TextMemory()
                 suspend fun offer(p: Phrase) {
-                    if (memory.seen(p.text) || local.seen(p.text)) return
+                    if (local.seen(p.text)) return
+                    // Новая реплика целиком, или продолжение той, что раньше была обрезана краем
+                    val say = memory.unread(p.text) ?: return
                     local.add(p.text)
-                    emit(p.text)
+                    emit(Utterance(say, p.text))
                 }
                 // Текст вне пузырей; то, что пересекается с репликами из пузырей, уже прочитано
                 fun outside(list: List<Phrase>) =
@@ -447,7 +454,7 @@ class ReaderService : AccessibilityService() {
                     continue
                 }
                 // Дальше листать некуда — дочитываем низ экрана и останавливаемся
-                readScreen(shot, excl, statusBar, skipTopCut = !firstScreen, skipBottomCut = false)
+                readScreen(shot, excl, statusBar, skipTopCut = !firstScreen, skipBottomCut = false, newScreen = false)
                 setState(State.SPEAKING)
                 speak("Конец главы.")
                 return
