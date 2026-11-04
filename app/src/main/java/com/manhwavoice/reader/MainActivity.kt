@@ -78,7 +78,7 @@ class MainActivity : Activity() {
             root.addView(bar)
         }
 
-        text("Озвучка манхвы", 24f, bold = true, top = 0)
+        text(getString(R.string.app_name), 24f, bold = true, top = 0)
         status = text("", 16f, top = 10)
         button("Открыть настройки спецвозможностей") {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
