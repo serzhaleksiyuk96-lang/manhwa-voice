@@ -5,6 +5,9 @@ import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
+import android.speech.tts.TextToSpeech
+import android.speech.tts.Voice
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.sqrt
 
@@ -20,7 +23,13 @@ object Prefs {
     /** Пауза на экране без текста, мс */
     fun pauseNoText(p: SharedPreferences) = p.getInt(KEY_PAUSE_EMPTY, 800).toLong()
 
+    /** Высота голоса, 50..200 (%) */
+    fun pitch(p: SharedPreferences) = p.getInt(KEY_PITCH, 100) / 100f
+
     const val KEY_RATE = "rate"
+    const val KEY_PITCH = "pitch"
+    const val KEY_ENGINE = "tts_engine"
+    const val KEY_VOICE = "tts_voice"
     const val KEY_SCROLL = "scroll"
     const val KEY_PAUSE_TEXT = "pause_text"
     const val KEY_PAUSE_EMPTY = "pause_empty"
@@ -66,5 +75,41 @@ object Fingerprint {
         var v = 0.0
         for (x in a) v += (x - mean) * (x - mean)
         return sqrt(v / a.size) < 6.0
+    }
+}
+
+/** Выбор движка и голоса синтеза речи. */
+object Voices {
+    val RU: Locale = Locale.forLanguageTag("ru-RU")
+
+    fun enginePref(p: SharedPreferences): String? = p.getString(Prefs.KEY_ENGINE, null)?.takeIf { it.isNotEmpty() }
+
+    fun create(context: Context, enginePkg: String?, listener: TextToSpeech.OnInitListener): TextToSpeech =
+        if (enginePkg == null) TextToSpeech(context, listener) else TextToSpeech(context, listener, enginePkg)
+
+    /** Русские голоса, установленные в движке: сначала те, что работают без интернета. */
+    fun russianVoices(tts: TextToSpeech): List<Voice> =
+        runCatching { tts.voices }.getOrNull().orEmpty()
+            .filter { v ->
+                v.locale.language == "ru" &&
+                    v.features?.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) != true
+            }
+            .sortedWith(compareBy<Voice>({ it.isNetworkConnectionRequired }, { it.name }))
+
+    fun describe(v: Voice, index: Int): String {
+        val net = if (v.isNetworkConnectionRequired) "нужен интернет" else "без интернета"
+        return "Голос ${index + 1} · $net\n${v.name}"
+    }
+
+    /** Применяет сохранённые голос, высоту и скорость. */
+    fun apply(tts: TextToSpeech, p: SharedPreferences) {
+        val name = p.getString(Prefs.KEY_VOICE, null)
+        if (name != null && tts.voice?.name != name) {
+            russianVoices(tts).firstOrNull { it.name == name }?.let { tts.setVoice(it) }
+        } else if (name == null && tts.voice?.locale?.language != "ru") {
+            tts.setLanguage(RU)
+        }
+        tts.setPitch(pitch(p))
+        tts.setSpeechRate(Prefs.rate(p))
     }
 }

@@ -22,7 +22,10 @@ class MainActivity : Activity() {
 
     private lateinit var status: TextView
     private lateinit var updateStatus: TextView
-    private var testTts: TextToSpeech? = null
+    private var tts: TextToSpeech? = null
+    private var ttsOk = false
+    private lateinit var engineButton: Button
+    private lateinit var voiceButton: Button
     private var checking = false
     private var downloading = false
     private var waitingPermissionFor: Updater.Release? = null
@@ -105,15 +108,24 @@ class MainActivity : Activity() {
         slider("Пауза на кадрах без текста", Prefs.KEY_PAUSE_EMPTY, 200, 4000, 800) { String.format(Locale.US, "%.1f с", it / 1000f) }
 
         text("Голос", 18f, bold = true, top = 22)
-        button("Проверить голос") { testVoice() }
-        button("Настройки синтеза речи (выбрать голос)") {
-            runCatching { startActivity(Intent("com.android.settings.TTS_SETTINGS")) }
-                .onFailure { startActivity(Intent(Settings.ACTION_SETTINGS)) }
-        }
-        button("Скачать русский голос") {
+        engineButton = button("Движок: …") { chooseEngine() }
+        voiceButton = button("Голос: …") { chooseVoice() }
+        slider("Высота голоса", Prefs.KEY_PITCH, 50, 200, 100) { "$it%" }
+        button("▶ Прослушать") { preview() }
+        button("Скачать русские голоса") {
             runCatching { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) }
                 .onFailure { Toast.makeText(this, "Не удалось открыть установку голосов", Toast.LENGTH_LONG).show() }
         }
+        button("Системные настройки синтеза речи") {
+            runCatching { startActivity(Intent("com.android.settings.TTS_SETTINGS")) }
+                .onFailure { startActivity(Intent(Settings.ACTION_SETTINGS)) }
+        }
+        text(
+            "Хочется больше голосов? Установите из Google Play бесплатный движок RHVoice " +
+                "и скачайте в нём русские голоса — потом выберите его в «Движок».",
+            13f, top = 6
+        )
+        initTts()
 
         text("Если службу не дают включить", 18f, bold = true, top = 22)
         text(
@@ -219,26 +231,104 @@ class MainActivity : Activity() {
         return enabled.split(':').any { ComponentName.unflattenFromString(it) == me }
     }
 
-    private fun testVoice() {
-        testTts?.shutdown()
-        testTts = TextToSpeech(this) { st ->
-            val t = testTts ?: return@TextToSpeech
-            if (st != TextToSpeech.SUCCESS) {
-                Toast.makeText(this, "Синтез речи недоступен", Toast.LENGTH_LONG).show()
-                return@TextToSpeech
+    // ---------------- Голос ----------------
+
+    private fun initTts() {
+        tts?.shutdown()
+        ttsOk = false
+        val prefs = Prefs.get(this)
+        tts = Voices.create(this, Voices.enginePref(prefs)) { st ->
+            val t = tts
+            ttsOk = st == TextToSpeech.SUCCESS && t != null
+            if (ttsOk && t != null) {
+                val r = t.setLanguage(Voices.RU)
+                if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    Toast.makeText(this, "В этом движке нет русского голоса — нажмите «Скачать русские голоса» или выберите другой движок", Toast.LENGTH_LONG).show()
+                }
             }
-            val r = t.setLanguage(Locale.forLanguageTag("ru-RU"))
-            if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-                Toast.makeText(this, "Русский голос не установлен — нажмите «Скачать русский голос»", Toast.LENGTH_LONG).show()
-                return@TextToSpeech
-            }
-            t.setSpeechRate(Prefs.rate(Prefs.get(this)))
-            t.speak("Привет! Вот так будет звучать озвучка манхвы.", TextToSpeech.QUEUE_FLUSH, null, "test")
+            runOnUiThread { refreshVoiceLabels() }
         }
     }
 
+    private fun refreshVoiceLabels() {
+        val prefs = Prefs.get(this)
+        val t = tts
+        val enginePkg = Voices.enginePref(prefs)
+        val engines = t?.engines.orEmpty()
+        val engineLabel = if (enginePkg == null) {
+            val def = t?.defaultEngine
+            "по умолчанию" + (engines.firstOrNull { it.name == def }?.label?.let { " ($it)" } ?: "")
+        } else engines.firstOrNull { it.name == enginePkg }?.label ?: enginePkg
+        engineButton.text = "Движок: $engineLabel"
+
+        val voiceName = prefs.getString(Prefs.KEY_VOICE, null)
+        val voices = if (ttsOk && t != null) Voices.russianVoices(t) else emptyList()
+        val idx = voices.indexOfFirst { it.name == voiceName }
+        voiceButton.text = when {
+            voiceName == null || idx < 0 -> "Голос: стандартный"
+            else -> "Голос: " + Voices.describe(voices[idx], idx).substringBefore("\n")
+        }
+    }
+
+    private fun chooseEngine() {
+        val t = tts ?: return
+        val engines = t.engines
+        val labels = listOf("По умолчанию (как в системе)") + engines.map { it.label }
+        val prefs = Prefs.get(this)
+        val current = Voices.enginePref(prefs)
+        val checked = if (current == null) 0 else engines.indexOfFirst { it.name == current } + 1
+        AlertDialog.Builder(this)
+            .setTitle("Движок синтеза речи")
+            .setSingleChoiceItems(labels.toTypedArray<CharSequence>(), checked) { dialog, which ->
+                val e = prefs.edit().remove(Prefs.KEY_VOICE)
+                if (which == 0) e.remove(Prefs.KEY_ENGINE) else e.putString(Prefs.KEY_ENGINE, engines[which - 1].name)
+                e.apply()
+                dialog.dismiss()
+                initTts()
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun chooseVoice() {
+        val t = tts
+        if (t == null || !ttsOk) {
+            Toast.makeText(this, "Синтез речи ещё загружается, попробуйте через секунду", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val voices = Voices.russianVoices(t)
+        if (voices.isEmpty()) {
+            Toast.makeText(this, "В этом движке нет русских голосов. Нажмите «Скачать русские голоса» или выберите другой движок.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val prefs = Prefs.get(this)
+        val labels = listOf("Стандартный") + voices.mapIndexed { i, v -> Voices.describe(v, i) }
+        val currentName = prefs.getString(Prefs.KEY_VOICE, null)
+        val checked = voices.indexOfFirst { it.name == currentName } + 1
+        AlertDialog.Builder(this)
+            .setTitle("Голос (нажмите, чтобы прослушать)")
+            .setSingleChoiceItems(labels.toTypedArray<CharSequence>(), checked) { _, which ->
+                if (which == 0) prefs.edit().remove(Prefs.KEY_VOICE).apply()
+                else prefs.edit().putString(Prefs.KEY_VOICE, voices[which - 1].name).apply()
+                preview()
+            }
+            .setPositiveButton("Готово") { _, _ -> refreshVoiceLabels() }
+            .setOnDismissListener { refreshVoiceLabels() }
+            .show()
+    }
+
+    private fun preview() {
+        val t = tts
+        if (t == null || !ttsOk) {
+            Toast.makeText(this, "Синтез речи недоступен", Toast.LENGTH_LONG).show()
+            return
+        }
+        Voices.apply(t, Prefs.get(this))
+        t.speak("Хотите сказать, я, сильнейший рыцарь севера, сражён этим ничтожным выродком?!", TextToSpeech.QUEUE_FLUSH, null, "preview")
+    }
+
     override fun onDestroy() {
-        testTts?.shutdown()
+        tts?.shutdown()
         super.onDestroy()
     }
 }

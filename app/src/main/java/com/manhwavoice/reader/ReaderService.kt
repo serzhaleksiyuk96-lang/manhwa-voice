@@ -64,7 +64,8 @@ class ReaderService : AccessibilityService() {
     private var params: WindowManager.LayoutParams? = null
 
     private var tts: TextToSpeech? = null
-    private val ttsReady = CompletableDeferred<Boolean>()
+    private var ttsReady = CompletableDeferred<Boolean>()
+    private var ttsEngine: String? = null
     private val pending = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
 
     private val memory = TextMemory()
@@ -113,15 +114,19 @@ class ReaderService : AccessibilityService() {
     // ---------------- Синтез речи ----------------
 
     private fun initTts() {
-        tts = TextToSpeech(this) { status ->
+        val enginePkg = Voices.enginePref(prefs)
+        ttsEngine = enginePkg
+        val ready = CompletableDeferred<Boolean>()
+        ttsReady = ready
+        tts = Voices.create(this, enginePkg) { status ->
             val engine = tts
             if (status != TextToSpeech.SUCCESS || engine == null) {
-                ttsReady.complete(false)
-                return@TextToSpeech
+                ready.complete(false)
+                return@create
             }
-            val r = engine.setLanguage(Locale.forLanguageTag("ru-RU"))
+            val r = engine.setLanguage(Voices.RU)
             if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-                ttsReady.complete(false)
+                ready.complete(false)
             } else {
                 engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {}
@@ -136,8 +141,17 @@ class ReaderService : AccessibilityService() {
                         utteranceId?.let { pending.remove(it)?.complete(false) }
                     }
                 })
-                ttsReady.complete(true)
+                ready.complete(true)
             }
+        }
+    }
+
+    /** Если в настройках выбрали другой движок — перезапускаем синтез речи. */
+    private fun ensureEngine() {
+        if (Voices.enginePref(prefs) != ttsEngine) {
+            tts?.shutdown()
+            tts = null
+            initTts()
         }
     }
 
@@ -147,7 +161,7 @@ class ReaderService : AccessibilityService() {
         val id = UUID.randomUUID().toString()
         val done = CompletableDeferred<Boolean>()
         pending[id] = done
-        engine.setSpeechRate(Prefs.rate(prefs))
+        Voices.apply(engine, prefs)
         if (engine.speak(text, TextToSpeech.QUEUE_ADD, Bundle(), id) != TextToSpeech.SUCCESS) {
             pending.remove(id)
             return false
@@ -208,8 +222,9 @@ class ReaderService : AccessibilityService() {
             toast("Не удалось загрузить модель распознавания текста")
             return
         }
+        ensureEngine()
         if (!ttsReady.await()) {
-            toast("Нет русского голоса. Откройте приложение → «Настройки синтеза речи»")
+            toast("Нет русского голоса. Откройте приложение → раздел «Голос»")
             return
         }
         val statusBar = statusBarHeight()
