@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Пузырь реплики со звуковыми волнами -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M30,36 h34 a8,8 0 0 1 8,8 v16 a8,8 0 0 1 -8,8 h-20 l-10,9 v-9 h-4 a8,8 0 0 1 -8,-8 v-16 a8,8 0 0 1 8,-8 z" />
+    <path
+        android:fillColor="#FF3B2A6B"
+        android:pathData="M36,48 h28 v3 h-28 z M36,55 h20 v3 h-20 z" />
+    <path
+        android:strokeColor="#FFFFD54F"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M77,45 q4,7 0,14 M82,40 q8,12 0,24" />
+</vector>
