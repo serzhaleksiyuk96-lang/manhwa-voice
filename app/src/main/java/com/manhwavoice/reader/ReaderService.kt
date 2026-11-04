@@ -348,7 +348,8 @@ class ReaderService : AccessibilityService() {
 
     // ---------------- Распознавание экрана ----------------
 
-    private class ScreenResult(val count: Int, val lastTop: Float?)
+    /** count — сколько новых реплик (-1 — пустой экран), found — сколько текста вообще нашлось. */
+    private class ScreenResult(val count: Int, val lastTop: Float?, val found: Int = 0)
 
     /**
      * Распознаёт экран и ставит реплики в очередь речи. Пузыри — по одному сверху вниз:
@@ -374,6 +375,7 @@ class ReaderService : AccessibilityService() {
         if (newScreen) memory.nextScreen()
         if (prep.blank) return ScreenResult(-1, null)
         var count = 0
+        var found = 0
         var lastTop: Float? = null
         coroutineScope {
             val rest = async {
@@ -403,6 +405,7 @@ class ReaderService : AccessibilityService() {
             }
             val local = TextMemory()
             suspend fun offer(p: Phrase) {
+                found++
                 if (local.seen(p.text)) return
                 // Новая реплика целиком, или продолжение той, что раньше была обрезана краем
                 val say = memory.unread(p.text) ?: return
@@ -435,7 +438,7 @@ class ReaderService : AccessibilityService() {
                 }
             }
         }
-        return ScreenResult(count, lastTop)
+        return ScreenResult(count, lastTop, found)
     }
 
     // ---------------- Главный цикл ----------------
@@ -544,7 +547,13 @@ class ReaderService : AccessibilityService() {
                     else -> {
                         // Не уводить с экрана пузырь, который ещё читается
                         if (speaker.busy) speaker.awaitIdle()
-                        delay(if (res.count == 0) Prefs.pauseNoText(prefs) else BLANK_PAUSE_MS)
+                        delay(
+                            when {
+                                res.count < 0 -> BLANK_PAUSE_MS                        // пустой промежуток
+                                res.found > 0 -> Prefs.pauseAfterSpeech(prefs)         // только уже прочитанное
+                                else -> Prefs.pauseNoText(prefs)                       // кадр без текста
+                            }
+                        )
                     }
                 }
                 scroll(buttonRect())
