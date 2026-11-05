@@ -185,6 +185,18 @@ private fun ReadingCard(c: AppController) {
         ValueSlider("Пауза после текста", c.int(Prefs.KEY_PAUSE_TEXT, Prefs.DEFAULT_PAUSE_TEXT), 0..3000, ::seconds) { c.setInt(Prefs.KEY_PAUSE_TEXT, it) }
         ValueSlider("Пауза на кадрах без текста", c.int(Prefs.KEY_PAUSE_EMPTY, Prefs.DEFAULT_PAUSE_EMPTY), 200..4000, ::seconds) { c.setInt(Prefs.KEY_PAUSE_EMPTY, it) }
         Spacer(Modifier.height(6.dp))
+        Text("Порядок реплик", color = Palette.TextMain, fontSize = 15.sp)
+        Text(
+            "Пузыри рядом друг с другом: в манхве и вебтунах читают слева направо, в японской манге — справа налево",
+            color = Palette.TextDim, fontSize = 12.sp
+        )
+        Spacer(Modifier.height(8.dp))
+        val rtl = c.bool(Prefs.KEY_RTL, false)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ToggleChip("Манхва  →", !rtl) { c.setBool(Prefs.KEY_RTL, false) }
+            ToggleChip("Манга  ←", rtl) { c.setBool(Prefs.KEY_RTL, true) }
+        }
+        Spacer(Modifier.height(14.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Листать заранее", color = Palette.TextMain, fontSize = 15.sp)
@@ -237,6 +249,8 @@ private fun HelpCard() {
             "Откройте главу в Opera и включите полноэкранный режим.",
             "Нажмите на круглую кнопку ▶ — приложение начнёт читать и само листать вниз.",
             "Нажмите на кнопку ещё раз — пауза. Перетащите её пальцем, если мешает.",
+            "Для японской манги выберите в настройках «Порядок реплик: Манга ←».",
+            "Панели сайта сверху и снизу приложение замечает само после первой прокрутки и текст под ними не читает.",
             "Долгое нажатие — прочитать текущий экран заново.",
             "В конце страницы прозвучит «Конец главы» — откройте следующую и снова нажмите ▶."
         )

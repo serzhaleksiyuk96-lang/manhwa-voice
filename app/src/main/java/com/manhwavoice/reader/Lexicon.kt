@@ -64,13 +64,25 @@ class Lexicon private constructor(
             val r = rankOf(c) ?: continue
             if (r < bestRank) { bestRank = r; best = c }
         }
-        if (best == null && k.length >= 8) {
+        if (best == null && k.length >= 6) {
             for (c in e1) for (c2 in edits1(c, inserts = false)) {
                 val r = rankOf(c2) ?: continue
                 if (r < bestRank) { bestRank = r; best = c2 }
             }
-            // правка в две буквы — только к достаточно частому слову
-            if (bestRank > 100_000) best = null
+            // правка в две буквы — только к достаточно частому слову (для коротких слов — к очень частому)
+            if (bestRank > (if (k.length >= 8) 100_000 else 40_000)) best = null
+        }
+        return best
+    }
+
+    /** Частое слово (ранг не больше [maxRank]), отличающееся ровно одной буквой, или null. */
+    fun correct1(word: String, maxRank: Int): String? {
+        val k = key(word)
+        var best: String? = null
+        var bestRank = maxRank + 1
+        for (c in edits1(k, inserts = true)) {
+            val r = rankOf(c) ?: continue
+            if (r < bestRank) { bestRank = r; best = c }
         }
         return best
     }

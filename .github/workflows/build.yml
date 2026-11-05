@@ -48,11 +48,13 @@ jobs:
           path: ManhwaVoice-1.${{ github.run_number }}.apk
 
       - name: Удалить прошлый выпуск (чтобы не копились старые файлы)
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release delete latest --cleanup-tag -y --repo "${{ github.repository }}" || true
 
       - name: Выложить в Releases (удобно скачать с телефона)
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest

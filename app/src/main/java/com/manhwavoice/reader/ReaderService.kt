@@ -52,8 +52,11 @@ import java.io.File
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Служба спецвозможностей: плавающая кнопка поверх браузера, снимки экрана,
@@ -348,15 +351,25 @@ class ReaderService : AccessibilityService() {
 
     // ---------------- Распознавание экрана ----------------
 
-    /** count — сколько новых реплик (-1 — пустой экран), found — сколько текста вообще нашлось. */
-    private class ScreenResult(val count: Int, val lastTop: Float?, val found: Int = 0)
+    /**
+     * count — сколько новых реплик (-1 — пустой экран), lastTop — где последняя (доля высоты),
+     * found — сколько текста вообще нашлось, cutTop — где начинается текст, обрезанный снизу
+     * (прочитается после прокрутки; доля высоты), regionTop/regionBottom — видимая часть страницы.
+     */
+    private class ScreenResult(
+        val count: Int,
+        val lastTop: Float?,
+        val found: Int = 0,
+        val cutTop: Float? = null,
+        val regionTop: Float = 0f,
+        val regionBottom: Float = 1f
+    )
 
     /**
-     * Распознаёт экран и ставит реплики в очередь речи. Пузыри — по одному сверху вниз:
-     * каждый озвучивается, как только распознан (уже прочитанные узнаются по памяти без
-     * распознавания). Остальной экран параллельно ищется быстрой моделью, уточняется точной
-     * и вставляется по порядку.
-     * count — сколько реплик поставлено (-1 — пустой экран), lastTop — где последняя (доля высоты).
+     * Распознаёт экран и ставит реплики в очередь речи — строго в порядке чтения. Надписи
+     * распознают две быстрые модели параллельно (сомнительное перечитывает точная), а реплика
+     * звучит, как только распознаны она и все надписи перед ней. Уже прочитанные на прошлых
+     * экранах надписи узнаются по памяти без распознавания.
      */
     private suspend fun readScreen(
         speaker: Speaker,
@@ -367,83 +380,96 @@ class ReaderService : AccessibilityService() {
         skipBottomCut: Boolean,
         newScreen: Boolean = true
     ): ScreenResult {
+        val screenH = shot.height.toFloat()
+        val ins = insets
+        val topPx = ((ins?.top ?: 0f) * screenH).toInt()
+        val bottomPx = ((ins?.bottom ?: 0f) * screenH).toInt()
+        val rtl = Prefs.rtl(prefs)
         val prep = try {
-            withContext(Dispatchers.Default) { ocr.prepare(shot, excl, statusBar, skipTopCut, skipBottomCut) }
+            withContext(Dispatchers.Default) {
+                ocr.prepare(shot, excl, statusBar, topPx, bottomPx, skipTopCut, skipBottomCut, rtl)
+            }
         } finally {
             shot.recycle()
         }
         if (newScreen) memory.nextScreen()
-        if (prep.blank) return ScreenResult(-1, null)
+        val regionTop = prep.regionTop / prep.h.toFloat()
+        val regionBottom = prep.regionBottom / prep.h.toFloat()
+        if (prep.blank) return ScreenResult(-1, null, regionTop = regionTop, regionBottom = regionBottom)
+        val items = prep.items
         var count = 0
         var found = 0
         var lastTop: Float? = null
+        val local = TextMemory()
+        suspend fun offer(p: Phrase) {
+            found++
+            if (local.seen(p.text)) return
+            // Новая реплика целиком, или продолжение той, что раньше была обрезана краем
+            val say = memory.unread(p.text) ?: return
+            local.add(p.text)
+            speaker.say(Utterance(say, p.text))
+            count++
+            lastTop = p.box.top / prep.h.toFloat()
+        }
+        val results = Array(items.size) { CompletableDeferred<Phrase?>() }
         coroutineScope {
-            val rest = async {
-                val cands = withContext(ocr.restDispatcher) { ocr.detectRest(prep) }
-                if (cands.isEmpty()) emptyList() else withContext(ocr.bestDispatcher) { ocr.refine(cands) }
-            }
-            // Пузыри по одному, сверху вниз
-            val bubbleCh = Channel<Phrase?>(Channel.UNLIMITED)
-            launch {
-                try {
-                    for (b in prep.bubbles.sortedBy { it.box.top }) {
-                        val step = withContext(ocr.bubbleDispatcher) { ocr.bubbleFirst(prep, b) }
-                        val cached = step.cached
-                        val read = step.read
-                        val ph = when {
-                            cached != null -> cached.phrase
-                            read == null -> null
-                            read.needsSecondPass -> withContext(ocr.bestDispatcher) { ocr.bubbleSecond(read) }
-                            else -> read.checked.phrase
+            val next = AtomicInteger(0)
+            for (k in ocr.fastDispatchers.indices) {
+                launch(ocr.fastDispatchers[k]) {
+                    while (true) {
+                        val i = next.getAndIncrement()
+                        if (i >= items.size) break
+                        val item = items[i]
+                        try {
+                            val sig = ocr.cache.signature(prep, item)
+                            val hit = ocr.cache.find(item, sig)
+                            if (hit != null) {
+                                results[i].complete(hit.phrase)
+                                continue
+                            }
+                            val r = ocr.firstPass(prep, item, k)
+                            if (r.needsSecondPass) {
+                                launch(ocr.bestDispatcher) {
+                                    val ph = try {
+                                        ScreenText.finalPhrase(r, ocr.secondPass(r))
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "second pass failed", e)
+                                        null
+                                    }
+                                    ocr.cache.put(sig, ph)
+                                    results[i].complete(ph)
+                                }
+                            } else {
+                                val ph = ScreenText.finalPhrase(r, r.checked.phrase)
+                                ocr.cache.put(sig, ph)
+                                results[i].complete(ph)
+                            }
+                        } catch (c: CancellationException) {
+                            throw c
+                        } catch (e: Exception) {
+                            Log.e(TAG, "item OCR failed", e)
+                            results[i].complete(null)
                         }
-                        if (cached == null) ocr.cache.put(b, step.sig, ph)
-                        bubbleCh.send(ph)
-                    }
-                } finally {
-                    bubbleCh.close()
-                }
-            }
-            val local = TextMemory()
-            suspend fun offer(p: Phrase) {
-                found++
-                if (local.seen(p.text)) return
-                // Новая реплика целиком, или продолжение той, что раньше была обрезана краем
-                val say = memory.unread(p.text) ?: return
-                local.add(p.text)
-                speaker.say(Utterance(say, p.text))
-                count++
-                lastTop = p.box.top / prep.h.toFloat()
-            }
-            // Текст вне пузырей (пересекающийся с пузырями уже прочитан в них)
-            fun outside(list: List<Phrase>) =
-                list.filter { r -> prep.bubbles.none { TextLayout.intersects(it.box, r.box) } }
-            var restList: List<Phrase>? = null
-            val used = HashSet<Int>()
-            for (ph in bubbleCh) {
-                if (restList == null && rest.isCompleted) restList = outside(rest.await())
-                if (ph == null) continue
-                restList?.forEachIndexed { i, r ->
-                    if (i !in used && r.box.top < ph.box.top) {
-                        used += i
-                        offer(r)
                     }
                 }
+            }
+            // Реплики — по порядку чтения
+            for (i in items.indices) {
+                val ph = results[i].await() ?: continue
                 offer(ph)
             }
-            val all = restList ?: outside(rest.await())
-            all.forEachIndexed { i, r ->
-                if (i !in used) {
-                    used += i
-                    offer(r)
-                }
-            }
         }
-        return ScreenResult(count, lastTop, found)
+        val cut = prep.cutTop?.let { it / prep.h.toFloat() }
+        return ScreenResult(count, lastTop, found, cut, regionTop, regionBottom)
     }
 
     // ---------------- Главный цикл ----------------
 
     private var activeSpeaker: Speaker? = null
+
+    /** Неподвижные панели сайта сверху и снизу (узнаются после прокрутки; помнятся для приложения). */
+    private var insets: Overlays.Insets? = null
+    private var prevSmall: Overlays.Small? = null
 
     private fun toggle() {
         if (loopJob?.isActive == true) stopReading(null) else startReading()
@@ -451,6 +477,8 @@ class ReaderService : AccessibilityService() {
 
     private fun startReading() {
         readingPkg = foregroundPkg
+        insets = Prefs.insets(prefs, readingPkg)
+        prevSmall = null
         cacheDir.listFiles()?.filter { it.name.startsWith("fish_") }?.forEach { it.delete() }
         loopJob = scope.launch {
             try {
@@ -477,6 +505,19 @@ class ReaderService : AccessibilityService() {
         message?.let { toast(it) }
     }
 
+    /** После прокрутки: какие панели сайта не сдвинулись вместе со страницей. */
+    private fun updateInsets(small: Overlays.Small, screenH: Int, statusBar: Int, scrolled: Boolean) {
+        val prev = prevSmall
+        prevSmall = small
+        if (!scrolled || prev == null) return
+        val found = Overlays.detect(prev, small, statusBar / screenH.toFloat() + 0.005f) ?: return
+        val old = insets
+        if (old == null || abs(old.top - found.top) > 0.004f || abs(old.bottom - found.bottom) > 0.004f) {
+            insets = found
+            Prefs.saveInsets(prefs, readingPkg, found)
+        }
+    }
+
     private suspend fun runLoop() = coroutineScope {
         setState(State.BUSY)
         if (!ocr.ensureReady()) {
@@ -495,20 +536,22 @@ class ReaderService : AccessibilityService() {
         var noMove = 0
         var uniformRun = 0
         var firstScreen = true
+        var scrolled = false
         try {
             while (isActive) {
                 if (!speaker.busy) setState(State.BUSY)
-                val shot = takeShot()
+                val (shot, excl) = takeCleanShot()
                 if (shot == null) {
                     delay(300)
                     continue
                 }
-                val excl = buttonRect()
                 val fp = Fingerprint.of(shot, excl)
                 val uniform = Fingerprint.isUniform(fp)
                 uniformRun = if (uniform) uniformRun + 1 else 0
 
                 val stuck = prevFp != null && !uniform && Fingerprint.same(prevFp, fp)
+                if (!stuck) updateInsets(smallOf(shot), shot.height, statusBar, scrolled)
+                scrolled = false
                 if (stuck || uniformRun >= 15) {
                     noMove++
                     if (noMove == 1 && stuck) {
@@ -516,7 +559,7 @@ class ReaderService : AccessibilityService() {
                         shot.recycle()
                         speaker.awaitIdle()
                         delay(1000)
-                        scroll(excl)
+                        scroll(null)
                         delay(SETTLE_MS)
                         continue
                     }
@@ -529,23 +572,27 @@ class ReaderService : AccessibilityService() {
                 noMove = 0
                 prevFp = fp
 
-                val res = readScreen(speaker, shot, excl, statusBar, skipTopCut = !firstScreen, skipBottomCut = true)
+                val res = readScreen(speaker, shot, excl, statusBar, skipTopCut = true, skipBottomCut = true)
                 firstScreen = false
 
-                // Когда листать дальше
-                val frac = Prefs.scrollFraction(prefs)
+                // На сколько листать: не больше настройки и видимой части страницы; если внизу
+                // есть обрезанная надпись — так, чтобы после прокрутки она оказалась целиком на экране
+                val region = res.regionBottom - res.regionTop
+                var frac = min(Prefs.scrollFraction(prefs), region - 0.06f)
+                res.cutTop?.let { frac = min(frac, it - res.regionTop - 0.02f) }
+                frac = frac.coerceAtLeast(0.2f)
                 val lastTop = res.lastTop
                 when {
-                    // Последняя реплика экрана зазвучала, и её пузырь после прокрутки останется
+                    // Последняя реплика экрана зазвучала, и её надпись после прокрутки останется
                     // на экране — листаем и распознаём следующий экран, пока она звучит
-                    res.count > 0 && Prefs.earlyScroll(prefs) && lastTop != null && lastTop - frac >= EARLY_MARGIN ->
-                        speaker.awaitLastPlaying()
+                    res.count > 0 && Prefs.earlyScroll(prefs) && lastTop != null &&
+                        lastTop - frac - res.regionTop >= EARLY_MARGIN -> speaker.awaitLastPlaying()
                     res.count > 0 -> {
                         speaker.awaitIdle()
                         delay(Prefs.pauseAfterSpeech(prefs))
                     }
                     else -> {
-                        // Не уводить с экрана пузырь, который ещё читается
+                        // Не уводить с экрана надпись, которая ещё читается
                         if (speaker.busy) speaker.awaitIdle()
                         delay(
                             when {
@@ -556,7 +603,8 @@ class ReaderService : AccessibilityService() {
                         )
                     }
                 }
-                scroll(buttonRect())
+                scroll(frac, res.regionTop, res.regionBottom)
+                scrolled = true
                 delay(SETTLE_MS)
             }
         } finally {
@@ -565,7 +613,59 @@ class ReaderService : AccessibilityService() {
         }
     }
 
+    /** Уменьшенная копия снимка для поиска неподвижных панелей. */
+    private fun smallOf(shot: Bitmap): Overlays.Small {
+        val sw = max(1, shot.width / 4)
+        val sh = max(1, shot.height / 4)
+        val s = Bitmap.createScaledBitmap(shot, sw, sh, true)
+        val px = IntArray(sw * sh)
+        s.getPixels(px, 0, sw, 0, 0, sw, sh)
+        if (s != shot) s.recycle()
+        return Overlays.small(px, sw, sh)
+    }
+
     // ---------------- Снимок экрана ----------------
+
+    /**
+     * Снимок без нашей кнопки: она прячется на долю секунды, чтобы не закрывать текст под собой.
+     * Если кнопка всё же попала на снимок — возвращается её место, его закрасят.
+     */
+    private suspend fun takeCleanShot(): Pair<Bitmap?, Rect?> {
+        val b = button
+        val rect = buttonRect()
+        var hidden = false
+        if (b != null && b.visibility == View.VISIBLE) {
+            b.visibility = View.INVISIBLE
+            hidden = true
+            delay(HIDE_MS)
+        }
+        val shot = try {
+            takeShot()
+        } finally {
+            if (hidden) b?.visibility = View.VISIBLE
+        }
+        if (shot == null) return null to null
+        return shot to (if (rect != null && buttonVisibleIn(shot, rect)) rect else null)
+    }
+
+    /** На снимке видна кнопка (её фиолетово-розовый цвет в середине)? */
+    private fun buttonVisibleIn(shot: Bitmap, r: Rect): Boolean {
+        val cx = r.centerX()
+        val cy = r.centerY()
+        if (cx !in 0 until shot.width || cy !in 0 until shot.height) return false
+        var hits = 0
+        var all = 0
+        val d = r.width() / 5
+        for (dy in -1..1) for (dx in -1..1) {
+            val x = (cx + dx * d).coerceIn(0, shot.width - 1)
+            val y = (cy + dy * d).coerceIn(0, shot.height - 1)
+            val p = shot.getPixel(x, y)
+            val red = Color.red(p); val green = Color.green(p); val blue = Color.blue(p)
+            if (red > 100 && blue > 90 && green < 80 && red - green > 60) hits++
+            all++
+        }
+        return hits * 2 > all
+    }
 
     private suspend fun takeShot(): Bitmap? = suspendCancellableCoroutine { cont ->
         takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
@@ -595,14 +695,20 @@ class ReaderService : AccessibilityService() {
 
     // ---------------- Прокрутка ----------------
 
-    private suspend fun scroll(excl: Rect?) {
+    /**
+     * Листает на [frac] высоты экрана. Палец ведётся внутри видимой части страницы
+     * ([top]…[bottom] — доли высоты), чтобы не попасть на панели сайта.
+     */
+    private suspend fun scroll(frac: Float? = null, top: Float = 0f, bottom: Float = 1f) {
         val bounds = wm.currentWindowMetrics.bounds
         val w = bounds.width().toFloat()
         val h = bounds.height().toFloat()
-        val dist = h * Prefs.scrollFraction(prefs)
-        val startY = h * 0.5f + dist / 2f
-        val endY = startY - dist
+        val dist = h * (frac ?: Prefs.scrollFraction(prefs))
+        var startY = h * 0.5f + dist / 2f
+        startY = min(startY, h * bottom - h * 0.03f)
+        val endY = max(h * 0.02f, startY - dist)
         var x = w * 0.5f
+        val excl = buttonRect()
         if (excl != null && x >= excl.left - 30 && x <= excl.right + 30) {
             x = if (excl.centerX() > w / 2) w * 0.25f else w * 0.75f
         }
@@ -611,7 +717,7 @@ class ReaderService : AccessibilityService() {
             Path().apply { moveTo(x, startY); lineTo(x, endY) }, 0, 300, true
         )
         val ok = dispatch(GestureDescription.Builder().addStroke(move).build())
-        // 2) ...и на секунду задерживаем его на месте перед отпусканием, чтобы страница
+        // 2) ...и на мгновение задерживаем его на месте перед отпусканием, чтобы страница
         //    не «улетела» по инерции и прокрутка была предсказуемой
         if (ok) {
             val hold = move.continueStroke(Path().apply { moveTo(x, endY) }, 0, 90, false)
@@ -763,6 +869,8 @@ class ReaderService : AccessibilityService() {
         private const val TAG = "ManhwaReader"
         private const val SETTLE_MS = 220L
         private const val EARLY_MARGIN = 0.06f
+        /** Сколько ждать, пока кнопка спрячется перед снимком */
+        private const val HIDE_MS = 50L
         private const val BLANK_PAUSE_MS = 150L
         private const val FISH_PREFETCH = 3
         private const val ICON_PLAY = "▶"

@@ -31,7 +31,7 @@ object TextLayout {
     // Служебные слова, которые OCR часто приклеивает к соседнему («непозволю», «яже», «ктоже»)
     // (предлоги вроде «на», «за», «по» сюда не входят: это ещё и приставки — «нападай»)
     private val GLUE_FIRST = setOf("не", "ни", "и", "а", "я", "ты", "он", "мы", "вы", "но", "что", "как", "так", "это")
-    private val GLUE_LAST = setOf("же", "бы", "ли", "ка", "то")
+    private val GLUE_LAST = setOf("же", "бы", "ли", "ка", "то", "у", "в", "к", "с", "и", "а", "о", "я")
     // Настоящие двухбуквенные слова
     private val TWO_OK = setOf(
         "не", "ни", "на", "за", "по", "до", "от", "из", "во", "со", "ко", "об", "то", "же", "бы", "ли",
@@ -186,9 +186,10 @@ object TextLayout {
             return w to (if (rare) Trust.DOUBT else Trust.SURE)
         }
         if (w.conf >= 60f) {
-            // Уверенно, но нет в словаре: имя, редкое слово — или слипшиеся «непозволю», «выв».
-            // Быстрая модель часто склеивает слова уверенно, поэтому такое слово всегда сомнительно.
+            // Уверенно, но нет в словаре: имя, редкое слово — или слипшиеся «непозволю», «выв»,
+            // или одна буква прочитана не так («СОГЛАСЕМ»). Такое слово всегда сомнительно.
             glueSplit(lex, k)?.let { return w.copy(text = replaceCore(w.text, c, it)) to Trust.DOUBT }
+            if (k.length >= 5 && '-' !in k) lex.correct1(k, 30_000)?.let { return w.copy(text = replaceCore(w.text, c, it)) to Trust.DOUBT }
             return w to Trust.DOUBT
         }
         val fixed = lex.correct(k) ?: glueSplit(lex, k)
@@ -224,6 +225,11 @@ object TextLayout {
      */
     fun blockPhrase(rawWords: List<OcrWord>, box: Box): Phrase? = blockPhraseChecked(rawWords, box).phrase
 
+    private val NUMBER = Regex("^[0-9]{1,4}[.,!?…]*$")
+
+    /** Число (уверенно прочитанное): синтезатор прочитает его словами. */
+    private fun isNumber(w: OcrWord) = w.conf >= 70f && NUMBER.matches(w.text)
+
     /** Есть ли среди распознанного хоть что-то похожее на слова (иначе это обрывок рисунка). */
     fun looksLikeText(rawWords: List<OcrWord>): Boolean {
         val lex = lexicon
@@ -242,20 +248,27 @@ object TextLayout {
 
     fun blockPhraseChecked(rawWords: List<OcrWord>, box: Box): Checked {
         val withLetters = rawWords.count { w -> w.text.any { it.isLetter() } }
-        val cleaned = mergeHyphenated(
-            rawWords.map { it.copy(text = cleanWord(it.text)) }.filter { w -> w.text.any { it.isLetter() } }
-        )
-        if (cleaned.isEmpty()) return Checked(null, withLetters > 0)
-        var doubtful = false
+        // Числа («из 4 человек») оставляем; прочие значки без букв посреди текста — признак,
+        // что слово прочитано неверно («ВЫ» → «86/»): тогда стоит перечитать точной моделью
+        val numbers = rawWords.filter { isNumber(it) }.toSet()
+        val words = rawWords.map { it.copy(text = cleanWord(it.text)) }
+        val cleaned = mergeHyphenated(words.filterIndexed { i, w -> w.text.any { it.isLetter() } || rawWords[i] in numbers })
+        if (cleaned.none { w -> w.text.any { it.isLetter() } }) return Checked(null, withLetters > 0)
+        var doubtful = rawWords.any { w -> w.text.isNotBlank() && w.text.none { it.isLetter() } && w !in numbers &&
+            w.text.any { it.isLetterOrDigit() || it in "/\\|©®@#№%&*<>[]{}=+^_~" } }
         val heights = cleaned.map { it.box.height }.sorted()
         val med = heights[heights.size / 2].toDouble()
         val kept = ArrayList<OcrWord>()
         for (w in cleaned) {
+            if (w.text.none { it.isLetter() }) { kept += w; continue }   // число
             val t = w.text
             val letters = t.count { it.isLetter() }
             val cyr = t.count { isCyr(it) }
             if (cyr < letters * 0.6) { doubtful = true; continue }
-            if (cleaned.size >= 3 && (w.box.height > med * 2.3 || w.box.height < med * 0.35)) { doubtful = true; continue }
+            // слово сильно выше или ниже соседей — скорее кусок рисунка, если только это не настоящее слово
+            if (cleaned.size >= 3 && (w.box.height > med * 2.3 || w.box.height < med * 0.35) && wordClass(w) < 2) {
+                doubtful = true; continue
+            }
             val lc = t.lowercase().filter { it.isLetter() }
             if (lc.length == 1) {
                 if (lc in SINGLE_OK && w.conf >= 20f) kept += w else doubtful = true
@@ -312,6 +325,124 @@ object TextLayout {
     }
 
     /**
+     * Похоже ли на реплику (строже, чем [plausible]): в ней должны быть настоящие слова
+     * от трёх букв, и они — основная часть текста. Короткий ответ из служебных слов
+     * («Да?», «Ах!») — только если прочитан уверенно. Обрывки рисунка («У у», «Кит вы в хо»)
+     * так отсеиваются.
+     */
+    fun speechLike(text: String, conf: Double): Boolean {
+        val lex = lexicon ?: return true
+        var total = 0
+        var strong = 0
+        var weak = 0
+        for (raw in text.split(' ')) {
+            val c = core(raw)
+            if (c.isEmpty()) continue
+            val len = c.count { it.isLetter() }
+            total += len
+            val k = lex.key(c)
+            when {
+                k.length == 1 -> if (k in SINGLE_OK) weak += len
+                k.length == 2 -> if (k in TWO_OK || k in SHORT_OK) weak += len
+                k.length == 3 -> if ((lex.rankOf(k) ?: Int.MAX_VALUE) <= 20_000) strong += len
+                else -> if (c in lex) strong += len
+            }
+        }
+        if (total == 0) return false
+        if (strong >= 3 && strong * 3 >= total && (strong + weak) * 2 > total) return true
+        return strong == 0 && weak == total && total <= 4 && conf >= 75
+    }
+
+    /** Есть ли среди распознанного настоящие слова: одно от 4 букв или два от 3. */
+    fun hasRealWords(rawWords: List<OcrWord>): Boolean {
+        val lex = lexicon ?: return looksLikeText(rawWords)
+        var long = 0
+        var three = 0
+        for (w in rawWords) {
+            val c = core(cleanWord(w.text))
+            if (c.count { isCyr(it) } < c.length * 0.8) continue
+            val k = lex.key(c)
+            if (k.length >= 4 && c in lex) long++
+            else if (k.length == 3 && (lex.rankOf(k) ?: Int.MAX_VALUE) <= 20_000) three++
+        }
+        return long >= 1 || three >= 2
+    }
+
+    /** Насколько слово похоже на настоящее: 2 — частое, 1 — есть в словаре, 0 — нет. */
+    private fun wordClass(w: OcrWord): Int {
+        val lex = lexicon ?: return 1
+        val c = core(cleanWord(w.text))
+        if (c.isEmpty() || c.count { isCyr(it) } < c.length * 0.8) return 0
+        val k = lex.key(c)
+        return when {
+            k.length == 1 -> if (k in SINGLE_OK) 2 else 0
+            k.length == 2 -> if (k in TWO_OK) 2 else 0
+            else -> {
+                val r = lex.rankOf(k)
+                when {
+                    r != null && r <= (if (k.length == 3) 20_000 else 60_000) -> 2
+                    c in lex -> 1
+                    else -> 0
+                }
+            }
+        }
+    }
+
+    private fun overlapShare(a: Box, b: Box): Double {
+        val ix = min(a.right, b.right) - max(a.left, b.left)
+        val iy = min(a.bottom, b.bottom) - max(a.top, b.top)
+        if (ix <= 0 || iy <= 0) return 0.0
+        val small = min(a.width.toLong() * a.height, b.width.toLong() * b.height).coerceAtLeast(1)
+        return ix.toLong() * iy / small.toDouble()
+    }
+
+    /**
+     * Объединяет слова быстрой ([fast]) и точной ([best]) моделей, прочитанные с одной вырезки:
+     * слова сопоставляются по месту, из пары берётся настоящее слово (по словарю), при равенстве —
+     * более уверенное (точной модели — небольшое преимущество). Строки, которые нашла только
+     * одна модель, тоже попадают в результат.
+     */
+    fun combine(fast0: List<OcrWord>, best0: List<OcrWord>): List<OcrWord> {
+        // значки без букв не участвуют: они не должны «занимать» место настоящего слова
+        val fast = fast0.filter { w -> w.text.any { it.isLetter() } }
+        val best = best0.filter { w -> w.text.any { it.isLetter() } }
+        val n = fast.size + best.size
+        // группы слов, лежащих на одном месте (модели могут по-разному делить на слова)
+        val parent = IntArray(n) { it }
+        fun find(x: Int): Int { var r = x; while (parent[r] != r) r = parent[r]; return r }
+        for ((i, wa) in fast.withIndex()) for ((j, wb) in best.withIndex()) {
+            if (overlapShare(wa.box, wb.box) >= 0.5) {
+                val a = find(i); val b = find(fast.size + j)
+                if (a != b) parent[a] = b
+            }
+        }
+        val out = ArrayList<OcrWord>()
+        for (g in (0 until n).groupBy { find(it) }.values) {
+            val fs = g.filter { it < fast.size }.map { fast[it] }
+            val bs = g.filter { it >= fast.size }.map { best[it - fast.size] }
+            when {
+                fs.isEmpty() -> out += bs
+                bs.isEmpty() -> fs.filterTo(out) { it.conf >= 50 && wordClass(it) >= 1 }
+                fs.size == 1 && bs.size == 1 -> {
+                    val wa = fs[0]; val wb = bs[0]
+                    val sa = wordClass(wa) * 100 + wa.conf
+                    val sb = wordClass(wb) * 100 + wb.conf + 10
+                    out += if (sa > sb) wa else wb
+                }
+                // разная разбивка на слова: берём ту, где больше букв в настоящих словах
+                else -> out += if (sideScore(fs) > sideScore(bs) + 1) fs else bs
+            }
+        }
+        return out
+    }
+
+    /** Сколько букв в настоящих словах минус буквы в ненастоящих. */
+    private fun sideScore(ws: List<OcrWord>): Int = ws.sumOf { w ->
+        val letters = w.text.count { it.isLetter() }
+        when (wordClass(w)) { 2 -> letters; 1 -> letters / 2; else -> -letters }
+    }
+
+    /**
      * Объединяет результаты двух проходов распознавания. Если реплики пересекаются,
      * берём ту, в которой OCR увереннее.
      */
@@ -349,8 +480,13 @@ object TextLayout {
         return res.map { l -> l.sortedBy { it.box.left } }
     }
 
+    // Частицы, которые пишутся через дефис: «как-нибудь», «кто-то», «всё-таки»
+    private val HYPHEN_PARTICLES = setOf("нибудь", "либо", "то", "таки", "ка", "де")
+
     /**
-     * Склеивает слово, разорванное переносом: «СИЛЬНЕЙ-» + «ШИЙ» → «СИЛЬНЕЙШИЙ».
+     * Склеивает слово, разорванное переносом: «СИЛЬНЕЙ-» + «ШИЙ» → «СИЛЬНЕЙШИЙ», а слова с
+     * настоящим дефисом оставляет с ним: «КАК-» + «НИБУДЬ» → «КАК-НИБУДЬ», «ИЗ-» + «ЗА» → «ИЗ-ЗА».
+     * Если дефис потерялся («КОТО» + «РЫЙ»), а вместе получается частое слово — тоже склеивает.
      * Делается до проверки по словарю: половинки слов в словаре не найдутся.
      */
     fun mergeHyphenated(words: List<OcrWord>): List<OcrWord> {
@@ -358,27 +494,70 @@ object TextLayout {
         if (ls.size < 2) return words
         val out = ArrayList<OcrWord>()
         var carry: OcrWord? = null
+        var soft: OcrWord? = null
         for ((i, line) in ls.withIndex()) {
             for ((j, w0) in line.withIndex()) {
                 var w = w0
                 if (j == 0 && carry != null) {
                     if (w.text.firstOrNull()?.isLetter() == true) {
                         // рамка — от первой половинки, чтобы слово осталось в конце строки
-                        w = OcrWord(carry.text.dropLast(1) + w.text, carry.box, min(carry.conf, w.conf))
+                        w = OcrWord(joinParts(carry.text.dropLast(1), w.text), carry.box, min(carry.conf, w.conf))
                     } else out += carry
                     carry = null
+                }
+                if (j == 0 && soft != null) {
+                    val joined = softJoin(soft.text, w.text)
+                    if (joined != null) {
+                        w = OcrWord(joined, soft.box, min(soft.conf, w.conf))
+                    } else out += soft
+                    soft = null
                 }
                 val isLast = j == line.size - 1
                 val t = w.text
                 if (isLast && i < ls.size - 1 && t.length >= 2 && t.last() in "-‐‑" && t[t.length - 2].isLetter()) {
                     carry = w
+                } else if (isLast && i < ls.size - 1 && t.length >= 2 && t.all { it.isLetter() }) {
+                    soft = w
                 } else {
                     out += w
                 }
             }
         }
         carry?.let { out += it }
+        soft?.let { out += it }
         return out
+    }
+
+    /** Две половинки слова при переносе: с дефисом или без. */
+    private fun joinParts(a: String, b: String): String {
+        val lex = lexicon ?: return a + b
+        val ca = a.filter { it.isLetter() || it == '-' }.lowercase()
+        val cb = b.filter { it.isLetter() }.lowercase()
+        if (ca.isEmpty() || cb.isEmpty()) return a + b
+        val joinedRank = lex.rankOf(ca + cb)
+        val ra = lex.rankOf(ca) ?: Int.MAX_VALUE
+        val rb = lex.rankOf(cb) ?: Int.MAX_VALUE
+        return when {
+            cb in HYPHEN_PARTICLES && ca in lex && (joinedRank == null || joinedRank > 30_000) -> "$a-$b"
+            // «ИЗ-» + «ЗА»: обе половинки — частые слова, а слитно — редкость
+            ra <= 5_000 && rb <= 5_000 && (joinedRank == null || (joinedRank > 10_000 && joinedRank > 20 * max(ra, rb))) -> "$a-$b"
+            joinedRank != null -> a + b
+            ca.length >= 2 && ca in lex && cb.length >= 2 && cb in lex -> "$a-$b"
+            else -> a + b
+        }
+    }
+
+    /** Перенос без распознанного дефиса: склеить, только если вместе — гораздо более частое слово. */
+    private fun softJoin(a: String, b: String): String? {
+        val lex = lexicon ?: return null
+        val cb = b.takeWhile { it.isLetter() }
+        if (a.length < 2 || cb.length < 2) return null
+        val joinedRank = lex.rankOf(a + cb) ?: return null
+        if (joinedRank > 100_000) return null
+        val ra = lex.rankOf(a) ?: Int.MAX_VALUE
+        val rb = lex.rankOf(cb) ?: Int.MAX_VALUE
+        if (joinedRank.toLong() * 10 >= min(ra, rb)) return null
+        return a + b
     }
 
     /** Склеивает слова одной реплики построчно, слева направо. */

@@ -27,6 +27,26 @@ object Prefs {
     fun earlyScroll(p: SharedPreferences) = p.getBoolean(KEY_EARLY_SCROLL, true)
     const val KEY_EARLY_SCROLL = "early_scroll"
 
+    /** Порядок реплик справа налево (манга), иначе слева направо (манхва, вебтун) */
+    fun rtl(p: SharedPreferences) = p.getBoolean(KEY_RTL, false)
+    const val KEY_RTL = "read_rtl"
+
+    /** Неподвижные панели сайта (шапка, кнопки внизу) — запоминаются для каждого приложения */
+    fun insets(p: SharedPreferences, pkg: String?): Overlays.Insets? {
+        val v = p.getString(KEY_INSETS + (pkg ?: ""), null) ?: return null
+        val parts = v.split(',')
+        if (parts.size != 2) return null
+        val t = parts[0].toFloatOrNull() ?: return null
+        val b = parts[1].toFloatOrNull() ?: return null
+        return Overlays.Insets(t, b)
+    }
+
+    fun saveInsets(p: SharedPreferences, pkg: String?, i: Overlays.Insets) {
+        p.edit().putString(KEY_INSETS + (pkg ?: ""), "${i.top},${i.bottom}").apply()
+    }
+
+    private const val KEY_INSETS = "insets_"
+
     const val DEFAULT_PAUSE_TEXT = 200
     const val DEFAULT_PAUSE_EMPTY = 600
 
