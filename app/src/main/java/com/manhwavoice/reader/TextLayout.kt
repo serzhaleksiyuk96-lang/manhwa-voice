@@ -177,17 +177,27 @@ object TextLayout {
         if (c.isEmpty()) return null to Trust.DOUBT
         val k = lex.key(c)
         if (c in lex) {
+            // «ИЕ» вместо «НЕ»: в наклонном шрифте «Н» и «И» путаются
+            if (k.length == 2 && k !in TWO_OK) {
+                swapIN(lex, k, 1_000)?.takeIf { it in TWO_OK }?.let { return w.copy(text = replaceCore(w.text, c, it)) to Trust.DOUBT }
+            }
             // В словаре из интернета много коротких обрывков («ра», «ня») — для 2–3 букв строже
             if (k.length == 2 && k !in TWO_OK && w.conf < 75f) return null to Trust.DOUBT
             if (k.length == 3 && (lex.rankOf(k) ?: Int.MAX_VALUE) > 20_000 && w.conf < 60f) return null to Trust.DOUBT
             // «де» вместо «не», редкие «слова» вроде «такои», «выв» (опечатки из интернета) — сомнительно
             val rank = lex.rankOf(k) ?: Int.MAX_VALUE
+            // Редкое короткое слово в одной букве от очень частого — почти всегда ошибка
+            // распознавания: «ТЕРЕ» → «ТЕБЕ», «РУДУ» → «БУДУ», «МАНЕ» → «МНЕ»
+            if (rank > 30_000 && k.length in 3..6 && '-' !in k) {
+                lex.correct1(k, 2_000)?.let { return w.copy(text = replaceCore(w.text, c, it)) to Trust.DOUBT }
+            }
             val rare = (k.length == 2 && k !in TWO_OK) || (k.length == 3 && rank > 20_000) || rank > 60_000
             return w to (if (rare) Trust.DOUBT else Trust.SURE)
         }
         if (w.conf >= 60f) {
             // Уверенно, но нет в словаре: имя, редкое слово — или слипшиеся «непозволю», «выв»,
             // или одна буква прочитана не так («СОГЛАСЕМ»). Такое слово всегда сомнительно.
+            if (k.length in 2..4) swapIN(lex, k, 5_000)?.let { return w.copy(text = replaceCore(w.text, c, it)) to Trust.DOUBT }
             glueSplit(lex, k)?.let { return w.copy(text = replaceCore(w.text, c, it)) to Trust.DOUBT }
             if (k.length >= 5 && '-' !in k) lex.correct1(k, 30_000)?.let { return w.copy(text = replaceCore(w.text, c, it)) to Trust.DOUBT }
             return w to Trust.DOUBT
@@ -195,6 +205,19 @@ object TextLayout {
         val fixed = lex.correct(k) ?: glueSplit(lex, k)
         if (fixed != null) return w.copy(text = replaceCore(w.text, c, fixed)) to Trust.DOUBT
         return (if (w.conf >= 30f && c.length >= 4) w else null) to Trust.DOUBT
+    }
+
+    /** Одна «И» ↔ «Н» — и выходит частое слово (не реже [maxRank]): «ИЕ» → «НЕ», «ИЕТ» → «НЕТ». */
+    private fun swapIN(lex: Lexicon, k: String, maxRank: Int): String? {
+        var best: String? = null
+        var bestRank = maxRank + 1
+        for (i in k.indices) {
+            val alt = when (k[i]) { 'и' -> 'н'; 'н' -> 'и'; else -> continue }
+            val cand = k.substring(0, i) + alt + k.substring(i + 1)
+            val r = lex.rankOf(cand) ?: continue
+            if (r < bestRank) { best = cand; bestRank = r }
+        }
+        return best
     }
 
     /** Разделить слипшиеся слова, только если одна часть — служебное слово. */
@@ -256,6 +279,8 @@ object TextLayout {
         if (cleaned.none { w -> w.text.any { it.isLetter() } }) return Checked(null, withLetters > 0)
         var doubtful = rawWords.any { w -> w.text.isNotBlank() && w.text.none { it.isLetter() } && w !in numbers &&
             w.text.any { it.isLetterOrDigit() || it in "/\\|©®@#№%&*<>[]{}=+^_~" } }
+        // буквы в словах, которых нет среди частых (редкое слово, имя, исправленное слово)
+        var doubtLetters = 0
         val heights = cleaned.map { it.box.height }.sorted()
         val med = heights[heights.size / 2].toDouble()
         val kept = ArrayList<OcrWord>()
@@ -277,7 +302,12 @@ object TextLayout {
             }
             if (lc.length >= 4 && lc.toSet().size == 1) { doubtful = true; continue }
             val (cw, trust) = checkWord(w)
-            if (trust == Trust.DOUBT) doubtful = true
+            if (cw == null) doubtful = true
+            else if (trust == Trust.DOUBT) {
+                doubtLetters += lc.length
+                // короткие слова решают смысл («не» / «ие»): сомнение в них — повод перечитать
+                if (lc.length <= 3) doubtful = true
+            }
             cw?.let { kept += it }
         }
         if (kept.isEmpty()) return Checked(null, true)
@@ -296,7 +326,8 @@ object TextLayout {
         val text = joinLines(kept)
         if (text.isBlank()) return Checked(null, true)
         val conf = kept.map { it.conf }.average()
-        if (conf < 70) doubtful = true
+        // Длинная реплика с одним редким словом — не повод перечитывать её целиком точной моделью
+        if (conf < 65 || doubtLetters > letters * 0.12 || (letters < 12 && doubtLetters > 0)) doubtful = true
         return Checked(Phrase(text, box, conf), doubtful)
     }
 
@@ -349,7 +380,7 @@ object TextLayout {
             }
         }
         if (total == 0) return false
-        if (strong >= 3 && strong * 3 >= total && (strong + weak) * 2 > total) return true
+        if (strong >= 3 && strong * 3 >= total && (strong + weak) * 2 > total && (strong >= 6 || weak <= strong)) return true
         return strong == 0 && weak == total && total <= 4 && conf >= 75
     }
 
@@ -377,6 +408,14 @@ object TextLayout {
         return when {
             k.length == 1 -> if (k in SINGLE_OK) 2 else 0
             k.length == 2 -> if (k in TWO_OK) 2 else 0
+            '-' in k -> {
+                val parts = k.split('-').filter { it.isNotEmpty() }
+                when {
+                    parts.isNotEmpty() && parts.all { (lex.rankOf(it) ?: Int.MAX_VALUE) <= 60_000 } -> 2
+                    c in lex -> 1
+                    else -> 0
+                }
+            }
             else -> {
                 val r = lex.rankOf(k)
                 when {
@@ -402,16 +441,23 @@ object TextLayout {
      * более уверенное (точной модели — небольшое преимущество). Строки, которые нашла только
      * одна модель, тоже попадают в результат.
      */
-    fun combine(fast0: List<OcrWord>, best0: List<OcrWord>): List<OcrWord> {
-        // значки без букв не участвуют: они не должны «занимать» место настоящего слова
-        val fast = fast0.filter { w -> w.text.any { it.isLetter() } }
-        val best = best0.filter { w -> w.text.any { it.isLetter() } }
+    fun combine(fast0: List<OcrWord>, best0: List<OcrWord>): List<OcrWord> = combine(fast0, best0, null, null)
+
+    fun combine(
+        fast0: List<OcrWord>, best0: List<OcrWord>,
+        tailsF: java.util.IdentityHashMap<OcrWord, Box>?, tailsB: java.util.IdentityHashMap<OcrWord, Box>?
+    ): List<OcrWord> {
+        // значки без букв не участвуют: они не должны «занимать» место настоящего слова (числа — да)
+        val fast = fast0.filter { w -> w.text.any { it.isLetter() } || isNumber(w) }
+        val best = best0.filter { w -> w.text.any { it.isLetter() } || isNumber(w) }
         val n = fast.size + best.size
         // группы слов, лежащих на одном месте (модели могут по-разному делить на слова)
         val parent = IntArray(n) { it }
         fun find(x: Int): Int { var r = x; while (parent[r] != r) r = parent[r]; return r }
+        fun boxes(w: OcrWord, t: java.util.IdentityHashMap<OcrWord, Box>?) = listOfNotNull(w.box, t?.get(w))
         for ((i, wa) in fast.withIndex()) for ((j, wb) in best.withIndex()) {
-            if (overlapShare(wa.box, wb.box) >= 0.5) {
+            val same = boxes(wa, tailsF).any { a -> boxes(wb, tailsB).any { b -> overlapShare(a, b) >= 0.5 } }
+            if (same) {
                 val a = find(i); val b = find(fast.size + j)
                 if (a != b) parent[a] = b
             }
@@ -423,10 +469,12 @@ object TextLayout {
             when {
                 fs.isEmpty() -> out += bs
                 bs.isEmpty() -> fs.filterTo(out) { it.conf >= 50 && wordClass(it) >= 1 }
-                fs.size == 1 && bs.size == 1 -> {
+                fs.size == 1 && bs.size == 1 && abs(letterCount(fs[0]) - letterCount(bs[0])) < 3 -> {
                     val wa = fs[0]; val wb = bs[0]
-                    val sa = wordClass(wa) * 100 + wa.conf
-                    val sb = wordClass(wb) * 100 + wb.conf + 10
+                    // настоящее слово важнее уверенности; из двух настоящих — более частое
+                    // («БУДУ», а не «РУДУ»); точная модель при прочих равных надёжнее
+                    val sa = wordClass(wa) * 100 + freqBonus(wa) + wa.conf
+                    val sb = wordClass(wb) * 100 + freqBonus(wb) + wb.conf + 20
                     out += if (sa > sb) wa else wb
                 }
                 // разная разбивка на слова: берём ту, где больше букв в настоящих словах
@@ -435,6 +483,16 @@ object TextLayout {
         }
         return out
     }
+
+    private fun freqBonus(w: OcrWord): Int {
+        val lex = lexicon ?: return 0
+        val c = core(cleanWord(w.text))
+        if (c.isEmpty()) return 0
+        val r = lex.rankOf(lex.key(c)) ?: return 0
+        return when { r <= 1_000 -> 30; r <= 10_000 -> 15; else -> 0 }
+    }
+
+    private fun letterCount(w: OcrWord) = w.text.count { it.isLetter() }
 
     /** Сколько букв в настоящих словах минус буквы в ненастоящих. */
     private fun sideScore(ws: List<OcrWord>): Int = ws.sumOf { w ->
@@ -469,7 +527,7 @@ object TextLayout {
     /** Разбивает слова на строки (сверху вниз), внутри строки — слева направо. */
     private fun lines(g: List<OcrWord>): List<List<OcrWord>> {
         if (g.isEmpty()) return emptyList()
-        val avgH = g.map { it.box.height }.average()
+        val avgH = medianHeight(g)
         val res = mutableListOf<MutableList<OcrWord>>()
         for (w in g.sortedBy { it.box.centerY }) {
             val last = res.lastOrNull()
@@ -489,7 +547,13 @@ object TextLayout {
      * Если дефис потерялся («КОТО» + «РЫЙ»), а вместе получается частое слово — тоже склеивает.
      * Делается до проверки по словарю: половинки слов в словаре не найдутся.
      */
-    fun mergeHyphenated(words: List<OcrWord>): List<OcrWord> {
+    fun mergeHyphenated(words: List<OcrWord>): List<OcrWord> = mergeHyphenated(words, null)
+
+    /**
+     * То же, но для каждого склеенного слова запоминает рамку второй половинки ([tails]):
+     * по ней слово сопоставляется со словами другой модели, которые склеены не были.
+     */
+    fun mergeHyphenated(words: List<OcrWord>, tails: java.util.IdentityHashMap<OcrWord, Box>?): List<OcrWord> {
         val ls = lines(words)
         if (ls.size < 2) return words
         val out = ArrayList<OcrWord>()
@@ -501,14 +565,18 @@ object TextLayout {
                 if (j == 0 && carry != null) {
                     if (w.text.firstOrNull()?.isLetter() == true) {
                         // рамка — от первой половинки, чтобы слово осталось в конце строки
+                        val tail = w.box
                         w = OcrWord(joinParts(carry.text.dropLast(1), w.text), carry.box, min(carry.conf, w.conf))
+                        tails?.put(w, tail)
                     } else out += carry
                     carry = null
                 }
                 if (j == 0 && soft != null) {
                     val joined = softJoin(soft.text, w.text)
                     if (joined != null) {
+                        val tail = w.box
                         w = OcrWord(joined, soft.box, min(soft.conf, w.conf))
+                        tails?.put(w, tail)
                     } else out += soft
                     soft = null
                 }
@@ -556,13 +624,20 @@ object TextLayout {
         if (joinedRank > 100_000) return null
         val ra = lex.rankOf(a) ?: Int.MAX_VALUE
         val rb = lex.rankOf(cb) ?: Int.MAX_VALUE
-        if (joinedRank.toLong() * 10 >= min(ra, rb)) return null
+        // хотя бы одна половинка — обрывок: как самостоятельное слово она гораздо реже целого
+        if (ra.toLong() <= joinedRank.toLong() * 20 && rb.toLong() <= joinedRank.toLong() * 20) return null
         return a + b
     }
 
     /** Склеивает слова одной реплики построчно, слева направо. */
+    /** Типичная высота слова: медиана (одно слово с огромной рамкой не сливает строки). */
+    private fun medianHeight(g: List<OcrWord>): Double {
+        val hs = g.map { it.box.height }.sorted()
+        return hs[hs.size / 2].toDouble()
+    }
+
     fun joinLines(g: List<OcrWord>): String {
-        val avgH = g.map { it.box.height }.average()
+        val avgH = medianHeight(g)
         val sorted = g.sortedBy { it.box.centerY }
         val lines = mutableListOf<MutableList<OcrWord>>()
         for (w in sorted) {
@@ -597,7 +672,14 @@ object TextLayout {
         val letters = s.filter { it.isLetter() }
         if (letters.isEmpty()) return s
         val upper = letters.count { it.isUpperCase() }
-        if (upper < letters.length * 0.7) return s
+        if (upper < letters.length * 0.5) {
+            // текст в обычном регистре, но отдельные слова капсом («СЕЙЧАС») — их тоже в строчные,
+            // иначе синтезатор может прочитать их по буквам
+            return s.split(' ').joinToString(" ") { wd ->
+                val l = wd.filter { it.isLetter() }
+                if (l.length >= 2 && l.all { it.isUpperCase() }) wd.lowercase() else wd
+            }
+        }
         val lower = s.lowercase()
         val sb = StringBuilder(lower.length)
         var capNext = true

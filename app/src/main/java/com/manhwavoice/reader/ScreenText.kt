@@ -23,7 +23,12 @@ class TextItem(
     val letterH: Int,
     val inverse: Boolean,
     /** Рамки букв надписи (для надписи вне пузыря) */
-    val letters: List<Box>? = null
+    val letters: List<Box>? = null,
+    /**
+     * Скорее всего это текст (пузырь с буквами, несколько ровных строк). Сомнительное — звуки,
+     * куски рисунка — распознаётся во вторую очередь и не задерживает чтение настоящих реплик.
+     */
+    val likely: Boolean = true
 )
 
 /** Подготовленный снимок экрана. */
@@ -40,9 +45,12 @@ class Prepared(
     val items: List<TextItem>,
     /** Верх самой высокой надписи, обрезанной снизу (прочитается после прокрутки), или null */
     val cutTop: Int?,
-    /** Откуда брать пиксели для распознавания (по возможности — исходный снимок в полном разрешении) */
+    /** Откуда брать пиксели для распознавания мелкого текста (по возможности — исходный снимок в полном разрешении) */
     val src: GraySrc = GraySrc.of(gray, w, h)
-)
+) {
+    /** Рабочая копия экрана: для текста обычного размера её хватает, и распознаётся она быстрее */
+    val lo: GraySrc = GraySrc.of(gray, w, h)
+}
 
 /**
  * Узнаёт надписи, уже распознанные на прошлых экранах: после прокрутки это те же картинки,
@@ -189,6 +197,13 @@ object ScreenText {
             }
             if (inside.isNotEmpty()) {
                 inside.forEach { used[it] = true }
+                // Два соприкасающихся пузыря сливаются в одну белую область: столбцы текста рядом —
+                // это разные реплики, каждая читается отдельно
+                val blocks = inside.map { text.blocks[it] }
+                if (columns(blocks) > 1) {
+                    for (bl in blocks) items += TextItem(bl.box, null, bl.letterH, false, bl.parts, likely = true)
+                    continue
+                }
                 val hs = inside.flatMap { i -> List(text.blocks[i].letters) { text.blocks[i].letterH } }.sorted()
                 items += TextItem(b.box, b, hs[hs.size / 2], false)
                 continue
@@ -202,15 +217,39 @@ object ScreenText {
             }
             if (letters.size >= 4) {
                 val hs = letters.map { it.height }.sorted()
-                items += TextItem(b.box, b, hs[hs.size / 2], false)
+                items += TextItem(b.box, b, hs[hs.size / 2], false, likely = false)
             }
         }
         for (i in text.blocks.indices) {
             if (used[i]) continue
             val bl = text.blocks[i]
-            if (bl.standalone) items += TextItem(bl.box, null, bl.letterH, bl.inverse, bl.parts)
+            if (bl.standalone) items += TextItem(bl.box, null, bl.letterH, bl.inverse, bl.parts, likelyText(bl))
         }
         return items
+    }
+
+    /**
+     * Сколько столбцов текста в области: блоки, разнесённые по горизонтали больше чем на полторы
+     * буквы, и оба в несколько строк — это разные пузыри (одна строка, разорванная широким
+     * пробелом, столбцами не считается).
+     */
+    private fun columns(blocks: List<TextBlock>): Int {
+        val parent = IntArray(blocks.size) { it }
+        fun find(x: Int): Int { var r = x; while (parent[r] != r) r = parent[r]; return r }
+        for (i in blocks.indices) for (j in i + 1 until blocks.size) {
+            val a = blocks[i]; val b = blocks[j]
+            val gap = max(a.box.left, b.box.left) - min(a.box.right, b.box.right)
+            val apart = gap > 1.5f * max(a.letterH, b.letterH) && a.lines >= 2 && b.lines >= 2
+            if (!apart) parent[find(i)] = find(j)
+        }
+        return blocks.indices.map { find(it) }.toSet().size
+    }
+
+    /** Надпись вне пузыря, очень похожая на текст: несколько строк или длинная ровная строка. */
+    private fun likelyText(b: TextBlock): Boolean {
+        if (b.letterH > 45) return false
+        return if (b.inverse) b.lines >= 2 && b.letters >= 8
+        else (b.lines >= 2 && b.letters >= 6) || (b.letters >= 6 && b.ring >= 200)
     }
 
     // ---------------- Вырезка и распознавание ----------------
@@ -220,18 +259,25 @@ object ScreenText {
         val b = it.bubble
         return if (b != null) {
             TextFinder.cleanCrop(
-                p.src, it.box, false, max((2.5f * it.letterH).toInt(), it.letterH + 12), it.letterH,
+                source(p, it), it.box, false, max((2.5f * it.letterH).toInt(), it.letterH + 12), it.letterH,
                 dropTouching = false, inside = { x, y -> b.inside(x, y) }
             )
         } else {
             val m = max(6, (0.6f * it.letterH).toInt())
             val region = Box(it.box.left - m, max(p.regionTop, it.box.top - m), it.box.right + m, min(p.regionBottom, it.box.bottom + m))
             TextFinder.cleanCrop(
-                p.src, region, it.inverse, max((1.6f * it.letterH).toInt(), it.letterH + 4), it.letterH,
+                source(p, it), region, it.inverse, max((1.6f * it.letterH).toInt(), it.letterH + 4), it.letterH,
                 dropTouching = true, letters = it.letters
             )
         }
     }
+
+    /** Мелкий текст — из снимка в полном разрешении, обычный — из рабочей копии (быстрее). */
+    private fun source(p: Prepared, it: TextItem): GraySrc =
+        if (it.letterH < HIRES_BELOW) p.src else p.lo
+
+    /** Буквы ниже этого (в рабочем масштабе) берутся из снимка в полном разрешении */
+    private const val HIRES_BELOW = 18
 
     /** Результат первого (быстрого) прочтения. */
     class ItemRead(
@@ -261,7 +307,13 @@ object ScreenText {
      * месту: из каждой пары берётся то, что есть в словаре и прочитано увереннее.
      */
     fun secondPass(r: ItemRead, best: OcrFn): Phrase? {
-        val merged = TextLayout.combine(r.words, read(best, r.crop))
+        // слова, разорванные переносом, сначала склеиваются в каждом прочтении отдельно:
+        // половинки по отдельности в словаре не найти, и выбор между моделями был бы случайным
+        val tailsF = java.util.IdentityHashMap<OcrWord, Box>()
+        val tailsB = java.util.IdentityHashMap<OcrWord, Box>()
+        fun prep(ws: List<OcrWord>, t: java.util.IdentityHashMap<OcrWord, Box>) =
+            TextLayout.mergeHyphenated(ws.map { it.copy(text = TextLayout.cleanWord(it.text)) }, t)
+        val merged = TextLayout.combine(prep(r.words, tailsF), prep(read(best, r.crop), tailsB), tailsF, tailsB)
         val again = TextLayout.blockPhraseChecked(merged, r.item.box).phrase
         // ничего не вышло — вариант быстрой берём, только если он похож на речь
         return again ?: r.checked.phrase?.takeIf { TextLayout.speechLike(it.text, it.conf) }
@@ -272,16 +324,34 @@ object ScreenText {
         ph?.takeIf { TextLayout.speechLike(it.text, it.conf) }
 
     /** Всё подряд (для проверок на компьютере): быстрой моделью, сомнительное — точной. */
-    fun readAll(p: Prepared, fast: OcrFn, best: OcrFn, cache: ItemCache? = null): List<Phrase> =
-        p.items.mapNotNull { it ->
+    /**
+     * Все реплики экрана в том порядке, в каком их озвучивает приложение: по порядку чтения,
+     * но сомнительная надпись, которой нужно точное прочтение, — в конце (см. ReaderService).
+     */
+    fun readAll(p: Prepared, fast: OcrFn, best: OcrFn, cache: ItemCache? = null): List<Phrase> {
+        val later = ArrayList<Pair<ItemRead, ItemCache.Sig?>>()
+        val out = ArrayList<Phrase>()
+        fun second(r: ItemRead, sig: ItemCache.Sig?) {
+            val ph = finalPhrase(r, secondPass(r, best))
+            if (cache != null && sig != null) cache.put(sig, ph)
+            if (ph != null) out += ph
+        }
+        for (it in p.items) {
             val sig = cache?.signature(p, it)
             val hit = if (cache != null && sig != null) cache.find(it, sig) else null
-            if (hit != null) return@mapNotNull hit.phrase
+            if (hit != null) { hit.phrase?.let { ph -> out += ph }; continue }
             val r = firstPass(p, it, fast)
-            val ph = finalPhrase(r, if (r.needsSecondPass) secondPass(r, best) else r.checked.phrase)
+            if (r.needsSecondPass) {
+                if (it.likely) second(r, sig) else later += r to sig
+                continue
+            }
+            val ph = finalPhrase(r, r.checked.phrase)
             if (cache != null && sig != null) cache.put(sig, ph)
-            ph
+            if (ph != null) out += ph
         }
+        for ((r, sig) in later) second(r, sig)
+        return out
+    }
 }
 
 /**
@@ -291,6 +361,9 @@ object ScreenText {
  */
 object ReadingOrder {
 
+    /** Отладочный вывод (только для проверок на компьютере) */
+    @JvmField var debug = false
+
     fun sort(items: List<TextItem>, gray: IntArray, w: Int, h: Int, rtl: Boolean): List<TextItem> {
         if (items.size < 2) return items
         if (!rtl) return rows(items, false)
@@ -298,36 +371,52 @@ object ReadingOrder {
         return panels.flatMap { rows(it, true) }
     }
 
-    /** Строки: надпись в той же строке, если начинается не ниже середины первой надписи строки. */
-    private fun rows(items: List<TextItem>, rtl: Boolean): List<TextItem> {
-        val sorted = items.sortedBy { it.box.top }
-        val out = ArrayList<TextItem>()
-        var i = 0
-        while (i < sorted.size) {
-            val anchor = sorted[i]
-            val row = arrayListOf(anchor)
-            var j = i + 1
-            while (j < sorted.size) {
-                val c = sorted[j]
-                val limit = anchor.box.top + 0.5f * min(anchor.box.height, c.box.height)
-                if (c.box.top < limit) { row += c; j++ } else break
+    /**
+     * Порядок надписей: берём самую верхнюю; но если правее неё (для манги; для манхвы — левее)
+     * есть надпись, которая начинается выше её середины, — сначала та. Так пузыри одного «ряда»
+     * читаются в нужную сторону, даже если один чуть ниже другого.
+     */
+    private fun rows(items: List<TextItem>, rtl: Boolean): List<TextItem> =
+        greedy(items, rtl) { it.box }
+
+    private fun <T> greedy(units: List<T>, rtl: Boolean, box: (T) -> Box): List<T> {
+        val left = units.toMutableList()
+        val out = ArrayList<T>(units.size)
+        while (left.isNotEmpty()) {
+            var c = left.minByOrNull { box(it).top }!!
+            while (true) {
+                val cb = box(c)
+                val cx = (cb.left + cb.right) / 2
+                val next = left.filter { o ->
+                    val ob = box(o)
+                    val ox = (ob.left + ob.right) / 2
+                    o !== c && ob.top < cb.top + cb.height / 2 &&
+                        (if (rtl) ox > cx + cb.width / 4 else ox < cx - cb.width / 4)
+                }.minByOrNull { box(it).top } ?: break
+                c = next
             }
-            out += if (rtl) row.sortedByDescending { it.box.right } else row.sortedBy { it.box.left }
-            i = j
+            left.remove(c)
+            out += c
         }
         return out
     }
 
+    /** Разметка кадров: шаг сетки, «белое снаружи», номера кадров и их рамки (l, t, r, b, площадь). */
+    private class Segments(
+        val st: Int, val sw: Int, val sh: Int,
+        val outside: BooleanArray, val label: IntArray, val boxes: List<IntArray>, val minArea: Int
+    )
+
     /**
      * Кадры манги: белые поля и промежутки между кадрами соединены с краем страницы, а кадр
-     * обнесён рамкой. Заливаем белое от краёв экрана (в уменьшенном масштабе) — что не залилось,
-     * то кадры. Кадры читаются рядами сверху вниз, в ряду — справа налево.
+     * обнесён рамкой. Заливаем белое от краёв экрана (сетка 2×2 точки — чтобы не терять тонкие
+     * промежутки между кадрами): что не залилось, то кадры.
      */
-    private fun panels(gray: IntArray, w: Int, h: Int, items: List<TextItem>): List<List<TextItem>> {
-        val st = 4
+    private fun segment(gray: IntArray, w: Int, h: Int): Segments? {
+        val st = 2
         val sw = w / st
         val sh = h / st
-        if (sw < 8 || sh < 8) return listOf(items)
+        if (sw < 8 || sh < 8) return null
         val white = BooleanArray(sw * sh)
         for (y in 0 until sh) for (x in 0 until sw) {
             var sum = 0
@@ -335,9 +424,8 @@ object ReadingOrder {
                 val row = (y * st + dy) * w + x * st
                 for (dx in 0 until st) sum += gray[row + dx]
             }
-            white[y * sw + x] = sum >= 225 * st * st
+            white[y * sw + x] = sum >= 215 * st * st
         }
-        // заливка белого от краёв
         val outside = BooleanArray(sw * sh)
         val queue = IntArray(sw * sh)
         var qh = 0
@@ -354,11 +442,13 @@ object ReadingOrder {
             if (y > 0) push(i - sw)
             if (y < sh - 1) push(i + sw)
         }
-        // кадры — связные области «не снаружи»
+        // Кадры могут касаться друг друга тонкой перемычкой (рисунок выходит за рамку, растр у края):
+        // сначала «сжимаем» области на несколько точек — перемычки рвутся, кадры разделяются
+        val core = erode(outside, sw, sh, 4)
         val label = IntArray(sw * sh)
-        val boxes = ArrayList<IntArray>()     // l, t, r, b, площадь
+        val boxes = ArrayList<IntArray>()
         for (start in 0 until sw * sh) {
-            if (outside[start] || label[start] != 0) continue
+            if (!core[start] || label[start] != 0) continue
             val id = boxes.size + 1
             val bx = intArrayOf(sw, sh, -1, -1, 0)
             qh = 0; qt = 0
@@ -368,59 +458,143 @@ object ReadingOrder {
                 val x = i % sw
                 val y = i / sw
                 bx[0] = min(bx[0], x); bx[1] = min(bx[1], y); bx[2] = max(bx[2], x); bx[3] = max(bx[3], y); bx[4]++
-                if (x > 0 && !outside[i - 1] && label[i - 1] == 0) { label[i - 1] = id; queue[qt++] = i - 1 }
-                if (x < sw - 1 && !outside[i + 1] && label[i + 1] == 0) { label[i + 1] = id; queue[qt++] = i + 1 }
-                if (y > 0 && !outside[i - sw] && label[i - sw] == 0) { label[i - sw] = id; queue[qt++] = i - sw }
-                if (y < sh - 1 && !outside[i + sw] && label[i + sw] == 0) { label[i + sw] = id; queue[qt++] = i + sw }
+                if (x > 0 && core[i - 1] && label[i - 1] == 0) { label[i - 1] = id; queue[qt++] = i - 1 }
+                if (x < sw - 1 && core[i + 1] && label[i + 1] == 0) { label[i + 1] = id; queue[qt++] = i + 1 }
+                if (y > 0 && core[i - sw] && label[i - sw] == 0) { label[i - sw] = id; queue[qt++] = i - sw }
+                if (y < sh - 1 && core[i + sw] && label[i + sw] == 0) { label[i + sw] = id; queue[qt++] = i + sw }
             }
             boxes += bx
         }
-        val minArea = sw * sh / 50
-        // надпись → кадр (по центру; если центр на белом поле — по ближайшей точке кадра рядом)
-        val byPanel = HashMap<Int, MutableList<TextItem>>()
-        val loose = ArrayList<TextItem>()
+        return Segments(st, sw, sh, outside, label, boxes, sw * sh / 80)
+    }
+
+    /** Точки «внутри», у которых в квадрате ±[r] нет ни одной точки «снаружи». */
+    private fun erode(outside: BooleanArray, w: Int, h: Int, r: Int): BooleanArray {
+        val horiz = BooleanArray(w * h)
+        for (y in 0 until h) {
+            var lastOut = -1_000_000
+            val row = y * w
+            // слева направо: расстояние до ближайшей «снаружи» слева
+            val left = IntArray(w)
+            for (x in 0 until w) { if (outside[row + x]) lastOut = x; left[x] = x - lastOut }
+            lastOut = 1_000_000
+            for (x in w - 1 downTo 0) {
+                if (outside[row + x]) lastOut = x
+                horiz[row + x] = left[x] > r && lastOut - x > r
+            }
+        }
+        val out = BooleanArray(w * h)
+        for (x in 0 until w) {
+            val up = IntArray(h)
+            var last = -1_000_000
+            for (y in 0 until h) { if (!horiz[y * w + x]) last = y; up[y] = y - last }
+            last = 1_000_000
+            for (y in h - 1 downTo 0) {
+                if (!horiz[y * w + x]) last = y
+                out[y * w + x] = up[y] > r && last - y > r
+            }
+        }
+        return out
+    }
+
+    /**
+     * Надписи по кадрам. Страница режется на полосы по горизонтальным промежуткам между кадрами
+     * (строки, почти целиком белые снаружи: рисунок, заходящий на промежуток, не мешает); полосы —
+     * сверху вниз, в полосе кадры — справа налево, внутри кадра — надписи справа налево.
+     * Надпись, чей центр на белом поле (пузырь заходит за рамку), относится к кадру, в рамке
+     * которого лежит; если такого нет — к ближайшему кадру рядом; иначе стоит сама по себе.
+     */
+    private fun panels(gray: IntArray, w: Int, h: Int, items: List<TextItem>): List<List<TextItem>> {
+        val sg = segment(gray, w, h) ?: return listOf(items)
+        val st = sg.st; val sw = sg.sw; val sh = sg.sh
+        // полосы
+        val gutter = BooleanArray(sh) { y ->
+            var n = 0
+            for (x in 0 until sw) if (sg.outside[y * sw + x]) n++
+            n >= sw * 0.6f
+        }
+        val strips = ArrayList<IntArray>()       // [от, до) в клетках сетки
+        var y0 = -1
+        for (y in 0..sh) {
+            val g = y == sh || gutter[y]
+            if (!g && y0 < 0) y0 = y
+            if (g && y0 >= 0) { if (y - y0 >= 6) strips += intArrayOf(y0, y); y0 = -1 }
+        }
+        if (strips.isEmpty()) strips += intArrayOf(0, sh)
+        fun stripOf(cy: Int): Int {
+            var best = 0
+            var bestD = Int.MAX_VALUE
+            for ((k, s0) in strips.withIndex()) {
+                val d = if (cy < s0[0]) s0[0] - cy else if (cy >= s0[1]) cy - s0[1] + 1 else 0
+                if (d < bestD) { bestD = d; best = k }
+            }
+            return best
+        }
+        fun big(id: Int) = id > 0 && sg.boxes[id - 1][4] >= sg.minArea
+        // надпись → (полоса, кадр)
+        val groups = LinkedHashMap<Pair<Int, Int>, MutableList<TextItem>>()
+        var looseId = -1
         for (it in items) {
             val cx = (centerX(it) / st).coerceIn(0, sw - 1)
             val cy = (centerY(it) / st).coerceIn(0, sh - 1)
-            var id = label[cy * sw + cx]
-            if (id == 0 || boxes[id - 1][4] < minArea) {
+            val strip = stripOf(cy)
+            var id = sg.label[cy * sw + cx]
+            if (!big(id)) {
                 id = 0
-                val r = max(it.box.width, it.box.height) / (2 * st) + 2
+                var bestArea = Int.MAX_VALUE
+                for ((k, bx) in sg.boxes.withIndex()) {
+                    if (bx[4] < sg.minArea) continue
+                    if (cx < bx[0] || cx > bx[2] || cy < bx[1] || cy > bx[3]) continue
+                    val area = (bx[2] - bx[0] + 1) * (bx[3] - bx[1] + 1)
+                    if (area < bestArea) { bestArea = area; id = k + 1 }
+                }
+            }
+            if (id == 0) {
+                val r = max(it.box.width, it.box.height) / (2 * st) + 4
                 var bestD = Int.MAX_VALUE
                 for (y in max(0, cy - r)..min(sh - 1, cy + r)) for (x in max(0, cx - r)..min(sw - 1, cx + r)) {
-                    val q = label[y * sw + x]
-                    if (q == 0 || boxes[q - 1][4] < minArea) continue
+                    val q = sg.label[y * sw + x]
+                    if (!big(q)) continue
                     val d = abs(x - cx) + abs(y - cy)
                     if (d < bestD) { bestD = d; id = q }
                 }
             }
-            if (id == 0) loose += it else byPanel.getOrPut(id) { ArrayList() } += it
+            if (id == 0) id = looseId--
+            groups.getOrPut(strip to id) { ArrayList() } += it
         }
-        if (byPanel.size < 2) return listOf(items)
-        // кадры: ряды сверху вниз, в ряду — справа налево; надписи вне кадров — как отдельные «кадры»
-        class Unit(val l: Int, val t: Int, val r: Int, val b: Int, val items: List<TextItem>)
-        val units = ArrayList<Unit>()
-        for ((id, list) in byPanel) {
-            val bx = boxes[id - 1]
-            units += Unit(bx[0] * st, bx[1] * st, (bx[2] + 1) * st, (bx[3] + 1) * st, list)
-        }
-        for (it in loose) units += Unit(it.box.left, it.box.top, it.box.right, it.box.bottom, listOf(it))
-        units.sortBy { it.t }
+        if (debug) groups.forEach { (k, v) -> println("  полоса ${k.first}, кадр ${k.second}: " + v.map { it.box }) }
+        // рамка кадра в пределах полосы (у отдельной надписи — её рамка)
+        class Unit(val box: Box, val items: List<TextItem>)
+        val byStrip = groups.entries.groupBy { it.key.first }
         val out = ArrayList<List<TextItem>>()
-        var i = 0
-        while (i < units.size) {
-            val a = units[i]
-            val row = arrayListOf(a)
-            var j = i + 1
-            while (j < units.size) {
-                val c = units[j]
-                if (c.t < a.t + 0.5f * min(a.b - a.t, c.b - c.t)) { row += c; j++ } else break
+        for (k in byStrip.keys.sorted()) {
+            val units = byStrip.getValue(k).map { (key, list) ->
+                val id = key.second
+                val b = if (id > 0) {
+                    val s0 = strips[k]
+                    var l = sw; var t = sh; var r = -1; var bt = -1
+                    for (y in s0[0] until s0[1]) for (x in 0 until sw) {
+                        if (sg.label[y * sw + x] != id) continue
+                        if (x < l) l = x
+                        if (x > r) r = x
+                        if (y < t) t = y
+                        if (y > bt) bt = y
+                    }
+                    if (r < 0) list.map { it.box }.reduce { a, c -> a.union(c) }
+                    else Box(l * st, t * st, (r + 1) * st, (bt + 1) * st)
+                } else list.map { it.box }.reduce { a, c -> a.union(c) }
+                Unit(b, list)
             }
-            row.sortByDescending { it.r }
-            row.forEach { out += it.items }
-            i = j
+            for (u in greedy(units, true) { it.box }) out += u.items
         }
         return out
+    }
+
+    /** Для проверок на компьютере: шаг сетки и метки (−1 — белое снаружи, 0 — мелкое, >0 — кадры). */
+    fun debugPanels(gray: IntArray, w: Int, h: Int): Pair<Int, IntArray> {
+        val r = segment(gray, w, h) ?: return 1 to IntArray(0)
+        val out = IntArray(r.label.size) { i -> if (r.outside[i]) -1 else if (r.label[i] == 0) 0 else if (r.boxes[r.label[i] - 1][4] < r.minArea) 0 else r.label[i] }
+        return r.st to out
     }
 
     private fun centerX(it: TextItem) = (it.box.left + it.box.right) / 2

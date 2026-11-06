@@ -409,9 +409,25 @@ class ReaderService : AccessibilityService() {
             local.add(p.text)
             speaker.say(Utterance(say, p.text))
             count++
-            lastTop = p.box.top / prep.h.toFloat()
+            val top = p.box.top / prep.h.toFloat()
+            lastTop = lastTop?.let { max(it, top) } ?: top
         }
+        // Быстрое прочтение — по порядку чтения в два потока. Точное (медленное) — по очереди:
+        // сначала надписи, похожие на реплики, потом сомнительные (часто это рисунок).
+        // Сомнительная надпись, которой нужно точное прочтение, не задерживает остальные:
+        // она озвучивается в конце, если окажется текстом.
         val results = Array(items.size) { CompletableDeferred<Phrase?>() }
+        val needsBest = Array(items.size) { CompletableDeferred<Boolean>() }
+        class Pending(val i: Int, val read: ScreenText.ItemRead, val sig: ItemCache.Sig)
+        val queue = java.util.PriorityQueue<Pending>(compareBy<Pending>({ if (items[it.i].likely) 0 else 1 }, { it.i }))
+        val wake = Channel<Unit>(Channel.UNLIMITED)
+        val firstLeft = AtomicInteger(items.size)
+        val likelyFirstLeft = AtomicInteger(items.count { it.likely })
+        fun firstDone(i: Int) {
+            if (items[i].likely) likelyFirstLeft.decrementAndGet()
+            firstLeft.decrementAndGet()
+            wake.trySend(Unit)
+        }
         coroutineScope {
             val next = AtomicInteger(0)
             for (k in ocr.fastDispatchers.indices) {
@@ -425,36 +441,63 @@ class ReaderService : AccessibilityService() {
                             val hit = ocr.cache.find(item, sig)
                             if (hit != null) {
                                 results[i].complete(hit.phrase)
+                                needsBest[i].complete(false)
                                 continue
                             }
                             val r = ocr.firstPass(prep, item, k)
                             if (r.needsSecondPass) {
-                                launch(ocr.bestDispatcher) {
-                                    val ph = try {
-                                        ScreenText.finalPhrase(r, ocr.secondPass(r))
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "second pass failed", e)
-                                        null
-                                    }
-                                    ocr.cache.put(sig, ph)
-                                    results[i].complete(ph)
-                                }
+                                synchronized(queue) { queue.add(Pending(i, r, sig)) }
+                                needsBest[i].complete(true)
                             } else {
                                 val ph = ScreenText.finalPhrase(r, r.checked.phrase)
                                 ocr.cache.put(sig, ph)
                                 results[i].complete(ph)
+                                needsBest[i].complete(false)
                             }
                         } catch (c: CancellationException) {
                             throw c
                         } catch (e: Exception) {
                             Log.e(TAG, "item OCR failed", e)
                             results[i].complete(null)
+                            needsBest[i].complete(false)
+                        } finally {
+                            firstDone(i)
                         }
                     }
                 }
             }
+            launch(ocr.bestDispatcher) {
+                while (true) {
+                    val job = synchronized(queue) {
+                        val top = queue.peek()
+                        // сомнительную — только когда все похожие на реплики уже прочитаны быстро
+                        if (top != null && (items[top.i].likely || likelyFirstLeft.get() == 0)) queue.poll() else null
+                    }
+                    if (job == null) {
+                        if (firstLeft.get() == 0 && synchronized(queue) { queue.isEmpty() }) break
+                        wake.receive()
+                        continue
+                    }
+                    val ph = try {
+                        ScreenText.finalPhrase(job.read, ocr.secondPass(job.read))
+                    } catch (c: CancellationException) {
+                        throw c
+                    } catch (e: Exception) {
+                        Log.e(TAG, "second pass failed", e)
+                        null
+                    }
+                    ocr.cache.put(job.sig, ph)
+                    results[job.i].complete(ph)
+                }
+            }
             // Реплики — по порядку чтения
+            val later = ArrayList<Int>()
             for (i in items.indices) {
+                if (!items[i].likely && needsBest[i].await()) { later += i; continue }
+                val ph = results[i].await() ?: continue
+                offer(ph)
+            }
+            for (i in later) {
                 val ph = results[i].await() ?: continue
                 offer(ph)
             }

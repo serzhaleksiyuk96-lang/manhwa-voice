@@ -48,7 +48,7 @@ object TextFinder {
     @JvmField var debug = false
 
     /** Мелкий текст увеличивается до такой высоты букв перед распознаванием */
-    @JvmField var TARGET_H = 22
+    @JvmField var TARGET_H = 20
     /** «Полутёмное»: бледные штрихи букв (темнее этого) прирастают к буквам */
     private const val WEAK = 190
     /** Знак рядом с буквами оставляем, только если вокруг него светло (как у букв с обводкой) */
@@ -258,7 +258,7 @@ object TextFinder {
         fun f1(a: Int): Int { var x = a; while (p1[x] != x) { p1[x] = p1[p1[x]]; x = p1[x] }; return x }
         for (i in cand.indices) {
             val a = cand[i]
-            val reach = a.r + (1.3f * 1.8f * a.h).toInt()
+            val reach = a.r + (1.8f * 1.8f * a.h).toInt()
             var j = i + 1
             while (j < cand.size && cand[j].l <= reach) {
                 val b = cand[j]
@@ -266,7 +266,8 @@ object TextFinder {
                 if (hMax <= 1.8f * hMin) {
                     val ov = min(a.b, b.b) - max(a.t, b.t) + 1
                     val gap = max(b.l - a.r, a.l - b.r)
-                    if (ov >= 0.55f * hMin && gap <= 1.3f * hMax) {
+                    // пробел между словами бывает широким, но меньше двух букв
+                    if (ov >= 0.55f * hMin && gap <= 1.8f * hMax) {
                         val ra = f1(i); val rb = f1(j)
                         if (ra != rb) p1[ra] = rb
                     }
@@ -294,7 +295,7 @@ object TextFinder {
                 if (hov < -0.3f * hMax) continue
                 // строки одного абзаца выровнены: по центру (пузырь), по левому или правому краю
                 val wMax = max(a.r - a.l, b.r - b.l)
-                val centered = abs((a.l + a.r) - (b.l + b.r)) / 2 <= 0.25f * wMax + 0.5f * hMax
+                val centered = abs((a.l + a.r) - (b.l + b.r)) / 2 <= 0.25f * wMax + 1.0f * hMax
                 if (!centered && abs(a.l - b.l) > hMax && abs(a.r - b.r) > hMax) continue
                 // хотя бы одна из строк должна быть похожа на текст
                 if (!a.strong && !b.strong) continue
@@ -510,19 +511,85 @@ object TextFinder {
                 out[(y + pad) * outW + x + pad] = (if (inverse) 255 - g else g).toByte()
             }
         }
-        val img = GrayImage(outW, outH, out)
         val hs = letterH * s
+        val (img, rows) = spreadLines(GrayImage(outW, outH, out), hs)
         val up = if (hs > 0 && hs < targetH) min(2f, targetH / hs) else 1f
-        return if (up >= 1.2f) Crop(upscale(img, up), l - pad, t - pad, up, s)
-        else Crop(img, l - pad, t - pad, 1f, s)
+        return if (up >= 1.2f) Crop(upscale(img, up), l - pad, t - pad, up, s, rows)
+        else Crop(img, l - pad, t - pad, 1f, s, rows)
+    }
+
+    /** Просвет между строками в вырезке — не меньше этой доли высоты букв (0 — не раздвигать) */
+    @JvmField var LINE_GAP = 0.8f
+
+    /**
+     * Строки почти вплотную (курсив, тесный интервал): Tesseract бывает склеивает две строки
+     * в одну и теряет обе. Раздвигаем просветы между строками до [LINE_GAP] высоты букв.
+     * Возвращает картинку и для каждой её строки — строку исходной картинки (null — без изменений).
+     */
+    private fun spreadLines(img: GrayImage, letterH: Float): Pair<GrayImage, IntArray?> {
+        val w = img.w; val h = img.h; val px = img.px
+        val need = (LINE_GAP * letterH).roundToInt()
+        if (need <= 0) return img to null
+        val ink = BooleanArray(h)
+        for (y in 0 until h) {
+            val o = y * w
+            for (x in 0 until w) if ((px[o + x].toInt() and 0xFF) < 140) { ink[y] = true; break }
+        }
+        val tops = ArrayList<Int>(); val bots = ArrayList<Int>()
+        var y = 0
+        while (y < h) {
+            if (!ink[y]) { y++; continue }
+            val t = y
+            while (y < h && ink[y]) y++
+            tops += t; bots += y - 1
+        }
+        if (tops.size < 2) return img to null
+        // строки текста — полосы не ниже половины букв; мелкие (точки «Ё», запятые) — между ними
+        val major = tops.indices.filter { bots[it] - tops[it] + 1 >= 0.5f * letterH }
+        if (major.size < 2) return img to null
+        val add = IntArray(h)
+        var total = 0
+        for (m in 0 until major.size - 1) {
+            // самый широкий просвет между двумя соседними строками
+            var at = -1; var gap = -1
+            for (k in major[m] until major[m + 1]) {
+                val g = tops[k + 1] - bots[k] - 1
+                if (g > gap) { gap = g; at = bots[k] + 1 + g / 2 }
+            }
+            if (at < 0 || gap >= need) continue
+            add[at] += need - gap
+            total += need - gap
+        }
+        if (total == 0) return img to null
+        val nh = h + total
+        val out = ByteArray(w * nh) { -1 }
+        val map = IntArray(nh)
+        var ny = 0
+        for (yy in 0 until h) {
+            repeat(add[yy]) { map[ny++] = yy }
+            System.arraycopy(px, yy * w, out, ny * w, w)
+            map[ny++] = yy
+        }
+        return GrayImage(w, nh, out) to map
     }
 
     /** Вырезка: картинка, её начало в пикселях источника, увеличение и масштаб источника. */
-    class Crop(val img: GrayImage, val x0: Int, val y0: Int, val scale: Float, val srcScale: Float = 1f) {
+    class Crop(
+        val img: GrayImage, val x0: Int, val y0: Int, val scale: Float, val srcScale: Float = 1f,
+        /** Строки раздвинуты: для каждой строки картинки (до увеличения) — строка исходной вырезки */
+        val rows: IntArray? = null
+    ) {
+        private fun y(by: Int): Float {
+            val v = by / scale
+            val m = rows ?: return v
+            val i = v.toInt().coerceIn(0, m.size - 1)
+            return m[i] + (v - v.toInt())
+        }
+
         /** Рамку слова из вырезки — в координаты экрана (рабочий масштаб). */
         fun toScreen(bx: Box): Box = Box(
-            ((x0 + bx.left / scale) / srcScale).toInt(), ((y0 + bx.top / scale) / srcScale).toInt(),
-            ((x0 + bx.right / scale) / srcScale).toInt(), ((y0 + bx.bottom / scale) / srcScale).toInt()
+            ((x0 + bx.left / scale) / srcScale).toInt(), ((y0 + y(bx.top)) / srcScale).toInt(),
+            ((x0 + bx.right / scale) / srcScale).toInt(), ((y0 + y(bx.bottom)) / srcScale).toInt()
         )
     }
 
